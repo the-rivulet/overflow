@@ -2,17 +2,16 @@
 Symbol.prototype.toString = function() { return this.description!; };
 
 // anything that can be evaluated to get a value
-type Expression = symbol | Call | Return | Match;
+type Expression = symbol | Thing | Call | Return | Match;
 // anything that can be evaluated to do something
 type Statement = VarDefinition | FuncDefinition;
-// anything that can be a variable's value
-type Object = Opaque | Func;
 // anything that can be used as a type 
 type Type = symbol | FuncType;
 
+abstract class Thing {}
 // opaque values, used for passing in external arguments
-class Opaque {
-    constructor(public data: any) {}
+class Opaque extends Thing {
+    constructor(public data: any) { super(); }
     toString() {return `opaque "${this.data.toString()}"`;}
 }
 // a name with its type
@@ -21,7 +20,7 @@ class Identifier<Name extends symbol = symbol, Kind extends Type = Type> {
     toString() {return `${this.name.description} : ${this.kind.toString()}`;}
 }
 // a value with its type
-class Value<Data extends Object = Object, Kind extends Type = Type> {
+class Value<Data extends Thing = Thing, Kind extends Type = Type> {
     constructor(public data: Data, public kind: Kind) {}
     toString() {return `${this.data} : ${this.kind.toString()}`;}
 }
@@ -49,9 +48,9 @@ class FuncDefinition<Name extends symbol = symbol, Argument extends Identifier =
     constructor(public name: Name, public argument: Argument, public definition: Definition) {}
     toString() {return `fn ${this.name.description}(${this.argument.toString()}) { ${this.definition.toString()} }`;}
 }
-class Func<Argument extends Identifier = Identifier, Definition extends Expression = Expression> {
-    constructor(public argument: Argument, public definition: Definition) {}
-    toString() {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
+class Func<Argument extends Identifier = Identifier, Definition extends Expression = Expression> extends Thing {
+    constructor(public argument: Argument, public definition: Definition) { super(); }
+    toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
 }
 class FuncType<InType extends Type = Type, OutType extends Type = Type> {
     constructor(public inType: InType, public outType: OutType) {}
@@ -111,7 +110,7 @@ function evalStmt(code: Statement, symTable: SymTable): SymTable {
         // when checking the function's return type, it may reference the argument
         // so the argument should be temporarily added to the symbol table while type-checking
         const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-        return {...symTable, [code.name]: new Value(code, new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
+        return {...symTable, [code.name]: new Value(new Func(code.argument, code.definition), new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
     }
     throw new Error("Did not match any path");
 }
@@ -127,6 +126,14 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
         }
         // otherwise return whatever it was
         return symTable[code]!.kind;
+    } else if(code instanceof Thing) {
+        // check which kind of object it is
+        if(code instanceof Opaque) {
+            return Symbol(); // functionally useless, since this is too opaque to say anything about
+        } else if(code instanceof Func) {
+            const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
+            return new FuncType(code.argument.kind, checkExprType(code.definition, symTable2));
+        }
     } else if(code instanceof Call) {
         // first check the type of the thing we're calling...
         const vt = checkExprType(code.func, symTable);
@@ -170,19 +177,22 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
         }
         // otherwise return whatever it was
         return symTable[code]!;
+    } else if(code instanceof Thing) {
+        // return the value along with its type
+        return new Value(code, checkExprType(code, symTable));
     } else if(code instanceof Call) {
         // first make sure that the thing we're calling is defined...
         const v = evalExpr(code.func, symTable);
         // ... and that it is a function
-        if(!(v.data instanceof FuncDefinition)) {
+        if(!(v.data instanceof Func)) {
             throw new Error(`${code.func.toString()} is not a function, it is: ${v}`);
         }
-        const f: FuncDefinition<symbol, Identifier, Expression> = v.data;
+        const f: Func<Identifier, Expression> = v.data;
         // now evaluate the argument...
         const a = evalExpr(code.argument, symTable);
         // ... and ensure the argument's type is correct
         if(!(isSameType(a.kind, f.argument.kind))) {
-            throw new Error(`${f.name.description} expected an argument of type ${f.argument.kind.toString()}, but got ${a.kind.toString()}`);
+            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.kind.toString()}`);
         }
         // make a copy of the symbol table to add the argument to it
         // a copy is made because the argument symbols should not be retained after the function call
@@ -209,9 +219,18 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
 // boolean operations
 const _bool = Symbol("bool"), _true = Symbol("true"), _false = Symbol("false");
 const _x = Symbol("x"), _y = Symbol("y");
-const _not = Symbol("not");
+const _id = Symbol("id"), _not = Symbol("not"), _and = Symbol("and"), _or = Symbol("or");
 const booleanOps = evalStmts([
+    new FuncDefinition(_id, new Identifier(_x, _bool), _x),
     new FuncDefinition(_not, new Identifier(_x, _bool), new Match(
         _x, [new MatchCase(_true, _false)], _true
+    )),
+    new FuncDefinition(_and, new Identifier(_x, _bool), new Match(
+        _x, [new MatchCase(_true, _id)], new Func(new Identifier(_y, _bool), _false)
+    )),
+    new FuncDefinition(_or, new Identifier(_x, _bool), new Match(
+        _x, [new MatchCase(_false, _id)], new Func(new Identifier(_y, _bool), _true)
     ))
 ], {[_true]: new Value(new Opaque(true), _bool), [_false]: new Value(new Opaque(false), _bool)});
+
+console.log(evalExpr(new Call(new Call(_or, _true), _false), booleanOps).toString());
