@@ -15,58 +15,58 @@ class Opaque extends Thing {
     toString() {return `opaque "${this.data.toString()}"`;}
 }
 // a name with its type
-class Identifier<Name extends symbol = symbol, Kind extends Type = Type> {
-    constructor(public name: Name, public kind: Kind) {}
+class Identifier {
+    constructor(public name: symbol, public kind: Type) {}
     toString() {return `${this.name.description} : ${this.kind.toString()}`;}
 }
 // a value with its type
-class Value<Data extends Thing = Thing, Kind extends Type = Type> {
-    constructor(public data: Data, public kind: Kind) {}
+class Value {
+    constructor(public data: Thing, public kind: Type) {}
     toString() {return `${this.data} : ${this.kind.toString()}`;}
 }
 
 // calling a function on arguments
-class Call<Func extends Expression = Expression, Argument extends Expression = Expression> {
-    constructor(public func: Func, public argument: Argument) {}
+class Call {
+    constructor(public func: Expression, public argument: Expression) {}
     toString(): string {return `${this.func.toString()}(${this.argument.toString()})`;}
 }
 // defining a variable, allowing its identifier to be meaningful when evaluated later
 // this cannot be used to define functions, use `FuncDefinition` instead.
 // this is not an expression, instead it is a statement.
-class VarDefinition<Name extends symbol = symbol, Value extends Expression = Expression> {
-    constructor(public name: Name, public value: Value) {}
+class VarDefinition {
+    constructor(public name: symbol, public value: Expression) {}
     toString() {return `${this.name.description} = ${this.value.toString()}`;}
 }
 // returns a value from a statement, allowing it to be used as an expression.
 // this is the only way to have a statement return a value.
-class Return<Code extends Statement[] = Statement[], Returns extends Expression = Expression> {
-    constructor(public stmts: [...Code], public returns: Returns) {}
+class Return {
+    constructor(public stmts: Statement[], public returns: Expression) {}
     toString(): string {return `${this.stmts.map(x => x.toString()).join("; ")}; return ${this.returns.toString()}`;}
 }
 // used to define functions
-class FuncDefinition<Name extends symbol = symbol, Argument extends Identifier = Identifier, Definition extends Expression = Expression> {
-    constructor(public name: Name, public argument: Argument, public definition: Definition) {}
+class FuncDefinition {
+    constructor(public name: symbol, public argument: Identifier, public definition: Expression) {}
     toString() {return `fn ${this.name.description}(${this.argument.toString()}) { ${this.definition.toString()} }`;}
 }
 // a function disconnected from its name. if a `FuncDefinition` is `const id = (x => x);`
 // then the `Func` created would just be `x => x`
 // when a `Func` is instantiated from a `FuncDefinition` or returned from another function, it captures its context
-class Func<Argument extends Identifier = Identifier, Definition extends Expression = Expression> extends Thing {
+class Func extends Thing {
     closureTable: SymTable;
-    constructor(public argument: Argument, public definition: Definition) { super(); this.closureTable = {}; }
+    constructor(public argument: Identifier, public definition: Expression) { super(); this.closureTable = {}; }
     toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
 }
-class FuncType<InType extends Type = Type, OutType extends Type = Type> {
-    constructor(public inType: InType, public outType: OutType) {}
+class FuncType {
+    constructor(public inType: Type, public outType: Type) {}
     toString(): string {return `(${this.inType.toString()} => ${this.outType.toString()})`;}
 }
 // match-expressions, the fundamental control flow pattern
-class MatchCase<Left extends Expression = Expression, Right extends Expression = Expression> {
-    constructor(public lhs: Left, public rhs: Right) {}
+class MatchCase {
+    constructor(public lhs: Expression, public rhs: Expression) {}
     toString(): string {return `${this.lhs.toString()} -> ${this.rhs.toString()}`}
 }
-class Match<Variable extends Expression = Expression, Cases extends MatchCase[] = MatchCase[], Default extends Expression = Expression> {
-    constructor(public variable: Variable, public cases: [...Cases], public otherwise: Default) {}
+class Match {
+    constructor(public variable: Expression, public cases: MatchCase[], public otherwise: Expression) {}
     toString(): string {return `match(${this.variable.toString()}) { ${[...this.cases, `else -> ${this.otherwise.toString()}`].map(x => x.toString()).join("; ")} }`;}
 }
 
@@ -223,7 +223,7 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
         if(!(v.data instanceof Func)) {
             throw new Error(`${code.func.toString()} is not a function, it is: ${v}`);
         }
-        const f: Func<Identifier, Expression> = v.data;
+        const f: Func = v.data;
         // now evaluate the argument...
         const a = evalExpr(code.argument, symTable);
         // ... and ensure the argument's type is correct
