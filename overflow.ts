@@ -48,8 +48,12 @@ class FuncDefinition<Name extends symbol = symbol, Argument extends Identifier =
     constructor(public name: Name, public argument: Argument, public definition: Definition) {}
     toString() {return `fn ${this.name.description}(${this.argument.toString()}) { ${this.definition.toString()} }`;}
 }
+// a function disconnected from its name. if a `FuncDefinition` is `const id = (x => x);`
+// then the `Func` created would just be `x => x`
+// when a `Func` is instantiated from a `FuncDefinition` or returned from another function, it captures its context
 class Func<Argument extends Identifier = Identifier, Definition extends Expression = Expression> extends Thing {
-    constructor(public argument: Argument, public definition: Definition) { super(); }
+    closureTable: SymTable;
+    constructor(public argument: Argument, public definition: Definition) { super(); this.closureTable = {}; }
     toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
 }
 class FuncType<InType extends Type = Type, OutType extends Type = Type> {
@@ -83,12 +87,14 @@ type SymTable = Record<symbol, Value>;
 function checkStmtType(code: Statement, symTable: SymTable): SymTable {
     console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     if(code instanceof VarDefinition) {
+        // add the variable with the appropriate type, but with a value of undefined
+        // since it should never need to be evaluated for its value anyway
         return {...symTable, [code.name]: new Value(new Opaque(undefined), checkExprType(code.value, symTable))};
     } else if(code instanceof FuncDefinition) {
-        // literally the same as `evalStmt`
-        // since we have all the information anyway
+        // basically the same as `evalStmt`
+        // again, return undefined as the value
         const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-        return {...symTable, [code.name]: new Value(code, new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
+        return {...symTable, [code.name]: new Value(new Opaque(undefined), new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
     }
     throw new Error("Did not match any path");
 }
@@ -100,6 +106,7 @@ function evalStmt(code: Statement, symTable: SymTable): SymTable {
         // define the variable and add it to the symbol table
         // throw an error if you try to reinstantiate an existing symbol
         // cause it's better for things to be const by default
+        // especially important now that closures exist (because they would use the old value)
         if(code.name in symTable) {
             throw new Error(`${code.name.description} is already defined`);
         }
@@ -110,7 +117,11 @@ function evalStmt(code: Statement, symTable: SymTable): SymTable {
         // when checking the function's return type, it may reference the argument
         // so the argument should be temporarily added to the symbol table while type-checking
         const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-        return {...symTable, [code.name]: new Value(new Func(code.argument, code.definition), new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
+        const f = new Func(code.argument, code.definition);
+        // the function captures the current symbol table
+        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+        f.closureTable = {...symTable};
+        return {...symTable, [code.name]: new Value(f, new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
     }
     throw new Error("Did not match any path");
 }
@@ -151,7 +162,7 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
         return vt.outType;
     } else if(code instanceof Return) {
         // evaluate the statements in the `Return` for their types
-        let symTable2 = code.stmts.reduce((table, stmt) => checkStmtType(stmt, table), {...symTable});
+        const symTable2 = code.stmts.reduce((table, stmt) => checkStmtType(stmt, table), {...symTable});
         return checkExprType(code.returns, symTable2);
     } else if(code instanceof Match) {
         if(code.cases.length == 0) throw new Error("Match has no arms");
@@ -167,7 +178,7 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
 }
 // try to evaluate an expression, and return its value
 function evalExpr(code: Expression, symTable: SymTable): Value {
-    console.info(`Evaluating '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
+    console.info(`Evaluating '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
     // do something based on what kind of expression it is
     if(typeof code == "symbol") {
         // if an identifier, attempt to resolve it using the symbol table
@@ -178,6 +189,11 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
         // otherwise return whatever it was
         return symTable[code]!;
     } else if(code instanceof Thing) {
+        if(code instanceof Func) {
+            // if the value is a function, it captures its context in this moment
+            console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+            code.closureTable = {...symTable};
+        }
         // return the value along with its type
         return new Value(code, checkExprType(code, symTable));
     } else if(code instanceof Call) {
@@ -196,8 +212,8 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
         }
         // make a copy of the symbol table to add the argument to it
         // a copy is made because the argument symbols should not be retained after the function call
-        const innerSymTable: SymTable = {...symTable};
-        innerSymTable[f.argument.name] = a;
+        // also add the closure table if the function has one
+        const innerSymTable: SymTable = {...symTable, ...f.closureTable, [f.argument.name]: a};
         // after filling out the arguments in `innerSymTable`, evaluate it
         return evalExpr(f.definition, innerSymTable);
     } else if(code instanceof Return) {
@@ -220,17 +236,31 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
 const _bool = Symbol("bool"), _true = Symbol("true"), _false = Symbol("false");
 const _x = Symbol("x"), _y = Symbol("y");
 const _id = Symbol("id"), _not = Symbol("not"), _and = Symbol("and"), _or = Symbol("or");
+const _const = Symbol("const"), _andMeta = Symbol("andMeta"), _andClosure = Symbol("andClosure"), _orMeta = Symbol("orMeta"), _orClosure = Symbol("orClosure");
 const booleanOps = evalStmts([
     new FuncDefinition(_id, new Identifier(_x, _bool), _x),
+    new FuncDefinition(_const, new Identifier(_x, _bool), new Func(new Identifier(_y, _bool), _x)),
     new FuncDefinition(_not, new Identifier(_x, _bool), new Match(
         _x, [new MatchCase(_true, _false)], _true
     )),
     new FuncDefinition(_and, new Identifier(_x, _bool), new Match(
         _x, [new MatchCase(_true, _id)], new Func(new Identifier(_y, _bool), _false)
     )),
+    new FuncDefinition(_andMeta, new Identifier(_x, _bool), new Match(
+        _x, [new MatchCase(_true, _id)], new Call(_const, _false)
+    )),
+    new FuncDefinition(_andClosure, new Identifier(_x, _bool), new Func(new Identifier(_y, _bool), new Match(
+        _x, [new MatchCase(_true, _y)], _false
+    ))),
     new FuncDefinition(_or, new Identifier(_x, _bool), new Match(
         _x, [new MatchCase(_false, _id)], new Func(new Identifier(_y, _bool), _true)
-    ))
+    )),
+    new FuncDefinition(_orMeta, new Identifier(_x, _bool), new Match(
+        _x, [new MatchCase(_false, _id)], new Call(_const, _true)
+    )),
+    new FuncDefinition(_orClosure, new Identifier(_x, _bool), new Func(new Identifier(_y, _bool), new Match(
+        _x, [new MatchCase(_false, _y)], _true
+    )))
 ], {[_true]: new Value(new Opaque(true), _bool), [_false]: new Value(new Opaque(false), _bool)});
 
-console.log(evalExpr(new Call(new Call(_or, _true), _false), booleanOps).toString());
+console.log(evalExpr(new Call(new Call(_orMeta, _true), _false), booleanOps).toString());
