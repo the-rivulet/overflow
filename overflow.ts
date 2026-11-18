@@ -8,7 +8,7 @@ type Statement = VarDefinition | FuncDefinition;
 // anything that can be used as a type 
 type Type = symbol | FuncType;
 
-abstract class Thing {}
+abstract class Thing { private readonly _thing!: void; }
 // opaque values, used for passing in external arguments
 class Opaque extends Thing {
     constructor(public data: any) { super(); }
@@ -78,6 +78,23 @@ function isSameType(a: Type, b: Type): boolean {
         return b instanceof FuncType && isSameType(a.inType, b.inType) && isSameType(a.outType, b.outType);
     }
     throw new Error("Did not match any path");
+}
+// function for checking whether values match
+function isSameThing(a: Thing, b: Thing): boolean {
+    if(a instanceof Opaque) {
+        // just use the default comparison function between these unknown values
+        return b instanceof Opaque && a.data == b.data;
+    } else if(a instanceof Func) {
+        // functions cannot be "equal" per se
+        return false;
+    }
+    throw new Error("Did not match any path");
+}
+// this is a kind of "equality", but it's really more like "exactly the same"
+// it is conservative, returning false if the arguments aren't really exactly the same
+function isSameValue(a: Value, b: Value) {
+    if(!isSameType(a.kind, b.kind)) return false;
+    return isSameThing(a.data, b.data);
 }
 
 // the symbol table holds the value of every variable
@@ -155,7 +172,7 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
         // now check the type of the argument...
         const at = checkExprType(code.argument, symTable);
         // ... and ensure the argument's type is correct
-        if(!(isSameType(at, vt))) {
+        if(!(isSameType(at, vt.inType))) {
             throw new Error(`Cannot call function of type ${vt.toString()} with argument of type ${at.toString()}`);
         }
         // just give the return type
@@ -172,6 +189,9 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
             const at = checkExprType(arm.rhs, symTable);
             if(!(isSameType(arm1, at))) throw new Error(`First match arm returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
         }
+        // check the default case too
+        const defaultCase = checkExprType(code.otherwise, symTable);
+        if(!(isSameType(arm1, defaultCase))) throw new Error(`First match arm returns type ${arm1.toString()}, but default case returns type ${defaultCase.toString()}`);
         return arm1;
     }
     throw new Error("Did not match any path");
@@ -225,7 +245,7 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
         // call the appropriate expression
         for(const c of code.cases) {
             const lhs = evalExpr(c.lhs, symTable);
-            if(v == lhs) return evalExpr(c.rhs, symTable);
+            if(isSameValue(v, lhs)) return evalExpr(c.rhs, symTable);
         }
         return evalExpr(code.otherwise, symTable);
     }
