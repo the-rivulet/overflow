@@ -2,7 +2,7 @@
 Symbol.prototype.toString = function() { return this.description!; };
 
 // anything that can be evaluated to get a value
-type Expression = symbol | Thing | Call | Return | Match | Construct;
+type Expression = symbol | Thing | Call | Return | Match | Construct | PropertyAccess;
 // anything that can be evaluated to do something
 type Statement = VarDefinition | FuncDefinition;
 // anything that can be used as a type
@@ -77,8 +77,8 @@ class Match {
 // the type of every `ObjClass` is a special type: `Symbol.for("Type")`
 class ObjClass extends Thing {
     // each item in `constructors` is one way to construct this object
-    constructor(public constructors: Record<symbol, Identifier[]>) { super(); }
-    toString() {return `class { ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`;}
+    constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); }
+    toString() {return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`);}
 }
 // constructs a new object 
 class Construct {
@@ -91,6 +91,10 @@ class Construct {
 class Obj extends Thing {
     constructor(public toaster: ObjClass, public cons: symbol, public fields: Record<symbol, Value>) { super(); }
     toString() {return `object ${this.cons.description} { ${Reflect.ownKeys(this.fields).map(x => `${x.toString()} (${this.fields[x as symbol]!})`).join(", ")} }`;}
+}
+// get a field of an object
+class PropertyAccess {
+    constructor(public obj: Expression, public field: symbol) {}
 }
 
 // function for quickly dereferencing a value
@@ -248,6 +252,12 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
         const defaultCase = checkExprType(code.otherwise, symTable);
         if(!(isSameType(arm1, defaultCase, symTable))) throw new Error(`First match arm returns type ${arm1.toString()}, but default case returns type ${defaultCase.toString()}`);
         return arm1;
+    } else if(code instanceof Construct) {
+        // yeah idk how to do this other than just evaluating it
+        return evalExpr(code.toaster, symTable).kind;
+    } else if(code instanceof PropertyAccess) {
+        // see above.
+        return evalExpr(code, symTable).kind;
     }
     throw new Error("Did not match any path");
 }
@@ -335,6 +345,17 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
             computedFields[key as symbol] = evalExpr(code.fields[key as symbol]!, symTable);
         }
         return evalExpr(new Obj(cons.data, code.cons, computedFields), symTable);
+    } else if(code instanceof PropertyAccess) {
+        // once again, ensure that the expression is the proper type...
+        const obj = evalExpr(code.obj, symTable);
+        if(!(obj.data instanceof Obj)) {
+            throw new Error(`${code.obj.toString()} is not an object, it is: ${obj.toString()}`);
+        }
+        // ... then attempt to get its field
+        if(!(code.field in obj.data.fields)) {
+            throw new Error(`That object does not have a field named ${code.field.description}`);
+        }
+        return obj.data.fields[code.field]!;
     }
     throw new Error("Did not match any path");
 }
@@ -348,7 +369,7 @@ const booleanOps = [
     new VarDefinition(_Bool, new ObjClass({
         [_false]: [],
         [_true]: []
-    })),
+    }, "Bool")),
     new VarDefinition(_false, new Construct(_Bool, _false, {})),
     new VarDefinition(_true, new Construct(_Bool, _true, {})),
     new FuncDefinition(_id, new Identifier(_x, _Bool), _x),
@@ -380,14 +401,21 @@ console.log(evalExpr(new Call(new Call(_orMeta, _true), _false), boolTable).toSt
 
 // object testing
 const _Nat = Symbol("Nat"), _zero = Symbol("zero"), _succ = Symbol("succ"), _prev = Symbol("prev");
-const _0 = Symbol("0"), _1 = Symbol("1"), _2 = Symbol("2");
+const _0 = Symbol("0"), _anotherZero = Symbol("anotherZero"), _1 = Symbol("1"), _2 = Symbol("2");
+const _is0 = Symbol("is0"), _num = Symbol("num");
 const natNumbers = [
     new VarDefinition(_Nat, new ObjClass({
         [_zero]: [],
         [_succ]: [new Identifier(_prev, _Nat)]
-    })),
+    }, "Nat")),
     new VarDefinition(_0, new Construct(_Nat, _zero, {})),
+    new VarDefinition(_anotherZero, new Construct(_Nat, _zero, {})),
     new VarDefinition(_1, new Construct(_Nat, _succ, {[_prev]: _0})),
-    new VarDefinition(_2, new Construct(_Nat, _succ, {[_prev]: _1}))
+    new VarDefinition(_2, new Construct(_Nat, _succ, {[_prev]: _1})),
+    new FuncDefinition(_is0, new Identifier(_num, _Nat), new Match(_num, [
+        new MatchCase(_0, _true)
+    ], _false))
 ]
-const natTable = evalStmts(natNumbers, {});
+const natTable = evalStmts(natNumbers, boolTable);
+console.log(evalExpr(new Call(_is0, _anotherZero), natTable).toString());
+console.log(evalExpr(new Construct(_Nat, _succ, {[_prev]: new PropertyAccess(_2, _prev)}), natTable).toString());
