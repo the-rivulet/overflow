@@ -15,10 +15,14 @@ interface IStmt {
 }
 // anything that can be used as a type
 // `symbol` appears again, because a symbol could point to a class
-type Type = symbol | FuncType | ObjClass;
+type Type = symbol | IType;
+interface IType {
+    isSameType(b: Type, symTable: SymTable): boolean;
+}
 
 abstract class Thing implements IExpr {
     private readonly _thing!: void;
+    abstract isSameThing(b: Thing, symTable: SymTable): boolean;
     abstract checkExprType(symTable: SymTable): Type;
     evalExpr(symTable: SymTable): Value {
         return new Value(this, checkExprType(this, symTable));
@@ -29,6 +33,7 @@ abstract class Thing implements IExpr {
 class Opaque extends Thing {
     constructor(public data: any) { super(); }
     toString() {return `opaque "${this.data.toString()}"`;}
+    isSameThing(b: Thing, symTable: SymTable): boolean { return b instanceof Opaque && this.data == b.data; }
     checkExprType(_: SymTable): Type { return Symbol(); /* basically useless since it's Opaque */ }
 }
 // a name with its type
@@ -147,6 +152,7 @@ class Func extends Thing {
     closureTable: SymTable;
     constructor(public argument: Identifier, public definition: Expression) { super(); this.closureTable = {}; }
     toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
+    isSameThing(b: Thing, symTable: SymTable): boolean { return false; }
     checkExprType(symTable: SymTable): Type {
         const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
         return new FuncType(this.argument.kind, checkExprType(this.definition, symTable2));
@@ -157,9 +163,12 @@ class Func extends Thing {
         return super.evalExpr(symTable);
     }
 }
-class FuncType {
+class FuncType implements IType {
     constructor(public inType: Type, public outType: Type) {}
     toString(): string {return `(${this.inType.toString()} => ${this.outType.toString()})`;}
+    isSameType(b: Type, symTable: SymTable): boolean {
+        return b instanceof FuncType && isSameType(this.inType, b.inType, symTable) && isSameType(this.outType, b.outType, symTable);
+    }
 }
 // match-expressions, the fundamental control flow pattern
 class MatchCase {
@@ -197,12 +206,24 @@ class Match implements IExpr {
 // objects hold a collection of named and typed values
 // `ObjClass` is like `Func` ... in that it is a `Thing`.
 // the type of every `ObjClass` is a special type: `Symbol.for("Type")`
-class ObjClass extends Thing {
+class ObjClass extends Thing implements IType {
     // each item in `constructors` is one way to construct this object
     constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); }
     toString() {return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`);}
+    isSameThing(b: Thing, symTable: SymTable): boolean {
+        // classes are equal if their structures are the same
+        return b instanceof ObjClass && isSameType(this, b, symTable);
+    }
     checkExprType(_: SymTable): Type {
         return Symbol.for("Type"); // the type of any class is Type
+    }
+    isSameType(b: Type, symTable: SymTable): boolean {
+        return b instanceof ObjClass &&
+        Reflect.ownKeys(this.constructors).length == Reflect.ownKeys(b.constructors).length &&
+        Reflect.ownKeys(this.constructors).every(x => Reflect.ownKeys(b.constructors).includes(x)) &&
+        Reflect.ownKeys(this.constructors).every(x => this.constructors[x as symbol]!.every(
+            i => b.constructors[x as symbol]!.find(j => i.name == j.name && isSameType(i.kind, j.kind, symTable))
+        ));
     }
 }
 // constructs a new object 
@@ -234,6 +255,16 @@ class Construct implements IExpr {
 class Obj extends Thing {
     constructor(public toaster: ObjClass, public cons: symbol, public fields: Record<symbol, Value>) { super(); }
     toString() {return `object ${this.cons.description} { ${Reflect.ownKeys(this.fields).map(x => `${x.toString()} (${this.fields[x as symbol]!})`).join(", ")} }`;}
+    isSameThing(b: Thing, symTable: SymTable): boolean {
+        // objects are equal if all their fields are equal
+        // and they were constructed from the same constructor
+        // `isSameType` on the prototypes will check if they are structurally equal
+        // so all we need to do here is ensure that the fields' data is equal
+        return b instanceof Obj &&
+        this.cons == b.cons &&
+        isSameType(this.toaster, b.toaster, symTable) &&
+        Reflect.ownKeys(this.fields).every(f => isSameThing(b.fields[f as symbol]!.data, b.fields[f as symbol]!.data, symTable));
+    }
     checkExprType(_: SymTable): Type {
         return this.toaster;
     }
@@ -334,43 +365,14 @@ function isSameType(at: Type, bt: Type, symTable: SymTable): boolean {
     // where one is a class literal and the other is a symbol that dereferences to a class containing itself
     // that seems like a rare situation though so I will ignore it for now
     if(typeof at == "symbol" && typeof bt == "symbol") return at == bt;
-    const a = (typeof at == "symbol") ? deref(at, symTable).data as Type : at;
-    const b = (typeof bt == "symbol") ? deref(bt, symTable).data as Type : bt;
+    const a = (typeof at == "symbol") ? deref(at, symTable).data as unknown as IType : at;
+    const b = (typeof bt == "symbol") ? deref(bt, symTable).data as unknown as IType : bt;
     // compare
-    if(a instanceof FuncType) {
-        return b instanceof FuncType && isSameType(a.inType, b.inType, symTable) && isSameType(a.outType, b.outType, symTable);
-    } else if(a instanceof ObjClass) {
-        return b instanceof ObjClass &&
-        Reflect.ownKeys(a.constructors).length == Reflect.ownKeys(b.constructors).length &&
-        Reflect.ownKeys(a.constructors).every(x => Reflect.ownKeys(b.constructors).includes(x)) &&
-        Reflect.ownKeys(a.constructors).every(x => a.constructors[x as symbol]!.every(
-            i => b.constructors[x as symbol]!.find(j => i.name == j.name && isSameType(i.kind, j.kind, symTable))
-        ))
-    }
-    throw new Error("Did not match any path");
+    return a.isSameType(b, symTable);
 }
 // function for checking whether values match
 function isSameThing(a: Thing, b: Thing, symTable: SymTable): boolean {
-    if(a instanceof Opaque) {
-        // just use the default comparison function between these unknown values
-        return b instanceof Opaque && a.data == b.data;
-    } else if(a instanceof Func) {
-        // functions cannot be "equal" per se
-        return false;
-    } else if(a instanceof ObjClass) {
-        // classes are equal if their structures are the same
-        return b instanceof ObjClass && isSameType(a, b, symTable);
-    } else if(a instanceof Obj) {
-        // objects are equal if all their fields are equal
-        // and they were constructed from the same constructor
-        // `isSameType` on the prototypes will check if they are structurally equal
-        // so all we need to do here is ensure that the fields' data is equal
-        return b instanceof Obj &&
-        a.cons == b.cons &&
-        isSameType(a.toaster, b.toaster, symTable) &&
-        Reflect.ownKeys(a.fields).every(f => isSameThing(b.fields[f as symbol]!.data, b.fields[f as symbol]!.data, symTable));
-    }
-    throw new Error("Did not match any path");
+    return a.isSameThing(b, symTable);
 }
 // this is a kind of "equality", but it's really more like "exactly the same"
 // it is conservative, returning false if the arguments aren't really exactly the same
