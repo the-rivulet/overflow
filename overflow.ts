@@ -2,18 +2,34 @@
 Symbol.prototype.toString = function() { return this.description!; };
 
 // anything that can be evaluated to get a value
-type Expression = symbol | Thing | Call | Return | Match | Construct | PropertyAccess | Pattern;
+type Expression = symbol | IExpr;
+interface IExpr {
+    checkExprType(symTable: SymTable): Type;
+    evalExpr(symTable: SymTable): Value;
+}
 // anything that can be evaluated to do something
-type Statement = VarDefinition | FuncDefinition;
+type Statement = IStmt;
+interface IStmt {
+    checkStmtType(symTable: SymTable): SymTable;
+    evalStmt(symTable: SymTable): SymTable;
+}
 // anything that can be used as a type
 // `symbol` appears again, because a symbol could point to a class
 type Type = symbol | FuncType | ObjClass;
 
-abstract class Thing { private readonly _thing!: void; }
+abstract class Thing implements IExpr {
+    private readonly _thing!: void;
+    abstract checkExprType(symTable: SymTable): Type;
+    evalExpr(symTable: SymTable): Value {
+        return new Value(this, checkExprType(this, symTable));
+    }
+}
+
 // opaque values, used for passing in external arguments
 class Opaque extends Thing {
     constructor(public data: any) { super(); }
     toString() {return `opaque "${this.data.toString()}"`;}
+    checkExprType(_: SymTable): Type { return Symbol(); /* basically useless since it's Opaque */ }
 }
 // a name with its type
 class Identifier {
@@ -27,27 +43,102 @@ class Value {
 }
 
 // calling a function on arguments
-class Call {
+class Call implements IExpr {
     constructor(public func: Expression, public argument: Expression) {}
     toString(): string {return `${this.func.toString()}(${this.argument.toString()})`;}
+    checkExprType(symTable: SymTable): Type {
+        // first check the type of the thing we're calling...
+        const vt = checkExprType(this.func, symTable);
+        // ... and that it is a function
+        if(!(vt instanceof FuncType)) {
+            throw new Error(`${this.func.toString()} is not a function type, it is: ${vt.toString()}`);
+        }
+        // now check the type of the argument...
+        const at = checkExprType(this.argument, symTable);
+        // ... and ensure the argument's type is correct
+        if(!(isSameType(at, vt.inType, symTable))) {
+            throw new Error(`Cannot call function of type ${vt.toString()} with argument of type ${at.toString()}`);
+        }
+        // just give the return type
+        return vt.outType;
+    }
+    evalExpr(symTable: SymTable): Value {
+        // first make sure that the thing we're calling is defined...
+        const v = evalExpr(this.func, symTable);
+        // ... and that it is a function
+        if(!(v.data instanceof Func)) {
+            throw new Error(`${this.func.toString()} is not a function, it is: ${v.toString()}`);
+        }
+        const f: Func = v.data;
+        // now evaluate the argument...
+        const a = evalExpr(this.argument, symTable);
+        // ... and ensure the argument's type is correct
+        if(!(isSameType(a.kind, f.argument.kind, symTable))) {
+            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.kind.toString()}`);
+        }
+        // make a copy of the symbol table to add the argument to it
+        // a copy is made because the argument symbols should not be retained after the function call
+        // also add the closure table if the function has one
+        const innerSymTable: SymTable = {...symTable, ...f.closureTable, [f.argument.name]: a};
+        // after filling out the arguments in `innerSymTable`, evaluate it
+        return evalExpr(f.definition, innerSymTable);
+    }
 }
 // defining a variable, allowing its identifier to be meaningful when evaluated later
 // this cannot be used to define functions, use `FuncDefinition` instead.
 // this is not an expression, instead it is a statement.
-class VarDefinition {
+class VarDefinition implements IStmt {
     constructor(public name: symbol, public value: Expression) {}
     toString() {return `${this.name.description} = ${this.value.toString()}`;}
+    checkStmtType(symTable: SymTable): SymTable {
+        return {...symTable, [this.name]: new Value(new Opaque(undefined), checkExprType(this.value, symTable))};
+    }
+    evalStmt(symTable: SymTable): SymTable {
+        // define the variable and add it to the symbol table
+        // throw an error if you try to reinstantiate an existing symbol
+        // cause it's better for things to be const by default
+        // especially important now that closures exist (because they would use the old value)
+        if(this.name in symTable) {
+            throw new Error(`${this.name.description} is already defined`);
+        }
+        return {...symTable, [this.name]: evalExpr(this.value, symTable)};
+    }
 }
 // returns a value from a statement, allowing it to be used as an expression.
 // this is the only way to have a statement return a value.
-class Return {
+class Return implements IExpr {
     constructor(public stmts: Statement[], public returns: Expression) {}
     toString(): string {return `${this.stmts.map(x => x.toString()).join("; ")}; return ${this.returns.toString()}`;}
+    checkExprType(symTable: SymTable): Type {
+        // evaluate the statements in the `Return` for their types
+        const symTable2 = this.stmts.reduce((table, stmt) => checkStmtType(stmt, table), {...symTable});
+        return checkExprType(this.returns, symTable2);
+    }
+    evalExpr(symTable: SymTable): Value {
+        const outTable = this.stmts.reduce((table, stmt) => evalStmt(stmt, table), symTable);
+        return evalExpr(this.returns, outTable);
+    }
 }
 // used to define functions
-class FuncDefinition {
+class FuncDefinition implements IStmt {
     constructor(public name: symbol, public argument: Identifier, public definition: Expression) {}
     toString() {return `fn ${this.name.description}(${this.argument.toString()}) { ${this.definition.toString()} }`;}
+    checkStmtType(symTable: SymTable): SymTable {
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
+        return {...symTable, [this.name]: new Value(new Opaque(undefined), new FuncType(this.argument.kind, checkExprType(this.definition, symTable2)))};
+    }
+    evalStmt(symTable: SymTable): SymTable {
+        // the whole thing will be stored in the symbol table so it can be called when needed
+        // a variable just stores a value, but a function stores a whole object
+        // when checking the function's return type, it may reference the argument
+        // so the argument should be temporarily added to the symbol table while type-checking
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
+        const f = new Func(this.argument, this.definition);
+        // the function captures the current symbol table
+        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+        f.closureTable = {...symTable};
+        return {...symTable, [this.name]: new Value(f, new FuncType(this.argument.kind, checkExprType(this.definition, symTable2)))};
+    }
 }
 // a function disconnected from its name. if a `FuncDefinition` is `const id = (x => x);`
 // then the `Func` created would just be `x => x`
@@ -56,6 +147,15 @@ class Func extends Thing {
     closureTable: SymTable;
     constructor(public argument: Identifier, public definition: Expression) { super(); this.closureTable = {}; }
     toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
+    checkExprType(symTable: SymTable): Type {
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
+        return new FuncType(this.argument.kind, checkExprType(this.definition, symTable2));
+    }
+    evalExpr(symTable: SymTable): Value {
+        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+        this.closureTable = {...symTable};
+        return super.evalExpr(symTable);
+    }
 }
 class FuncType {
     constructor(public inType: Type, public outType: Type) {}
@@ -66,9 +166,31 @@ class MatchCase {
     constructor(public lhs: Expression, public rhs: Expression) {}
     toString(): string {return `${this.lhs.toString()} -> ${this.rhs.toString()}`}
 }
-class Match {
+class Match implements IExpr {
     constructor(public variable: Expression, public cases: MatchCase[], public otherwise: Expression) {}
     toString(): string {return `match(${this.variable.toString()}) { ${[...this.cases, `else -> ${this.otherwise.toString()}`].map(x => x.toString()).join("; ")} }`;}
+    checkExprType(symTable: SymTable): Type {
+        if(this.cases.length == 0) throw new Error("Match has no arms");
+        // the type should be the type of all match arms
+        const arm1 = checkExprType(this.cases[0]!.rhs, symTable);
+        for(const arm of this.cases.slice(1)) {
+            const at = checkExprType(arm.rhs, symTable);
+            if(!(isSameType(arm1, at, symTable))) throw new Error(`First match arm returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
+        }
+        // check the default case too
+        const defaultCase = checkExprType(this.otherwise, symTable);
+        if(!(isSameType(arm1, defaultCase, symTable))) throw new Error(`First match arm returns type ${arm1.toString()}, but default case returns type ${defaultCase.toString()}`);
+        return arm1;
+    }
+    evalExpr(symTable: SymTable): Value {
+        const v = evalExpr(this.variable, symTable);
+        // call the appropriate expression
+        for(const c of this.cases) {
+            const lhs = evalExpr(c.lhs, symTable);
+            if(isSameValue(v, lhs, symTable)) return evalExpr(c.rhs, symTable);
+        }
+        return evalExpr(this.otherwise, symTable);
+    }
 }
 
 // objects are a very useful type, because they allow "more types" to be created.
@@ -79,11 +201,32 @@ class ObjClass extends Thing {
     // each item in `constructors` is one way to construct this object
     constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); }
     toString() {return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`);}
+    checkExprType(_: SymTable): Type {
+        return Symbol.for("Type"); // the type of any class is Type
+    }
 }
 // constructs a new object 
-class Construct {
+class Construct implements IExpr {
     constructor(public toaster: Expression, public cons: symbol, public fields: Record<symbol, Expression>) {}
-    toString(): string {return `${this.toaster.toString()}.${this.cons.description}(${Reflect.ownKeys(this.fields).map(x => `${x.toString()} = ${this.fields[x as symbol]!.toString()}`).join(", ")})`}
+    toString(): string {return `${this.toaster.toString()}.${this.cons.description}(${Reflect.ownKeys(this.fields).map(x => `${x.toString()} = ${this.fields[x as symbol]!.toString()}`).join(", ")})`;}
+    checkExprType(symTable: SymTable): Type {
+        return evalExpr(this.toaster, symTable).kind;
+    }
+    evalExpr(symTable: SymTable): Value {
+        // construct an object
+        // the actual fields of the object will be checked in the `Thing` branch of this function
+        // so no need to do the work twice
+        const cons = evalExpr(this.toaster, symTable);
+        if(!(cons.data instanceof ObjClass)) {
+            throw new Error(`${this.toaster.toString()} is not a class, it is: ${cons.toString()}`);
+        }
+        // evaluate each field
+        const computedFields: Record<symbol, Value> = {};
+        for(const key of Reflect.ownKeys(this.fields)) {
+            computedFields[key as symbol] = evalExpr(this.fields[key as symbol]!, symTable);
+        }
+        return evalExpr(new Obj(cons.data, this.cons, computedFields), symTable);
+    }
 }
 // a constructed object
 // there is no way to stop someone from constructing one of these with mismatched fields
@@ -91,15 +234,88 @@ class Construct {
 class Obj extends Thing {
     constructor(public toaster: ObjClass, public cons: symbol, public fields: Record<symbol, Value>) { super(); }
     toString() {return `object ${this.cons.description} { ${Reflect.ownKeys(this.fields).map(x => `${x.toString()} (${this.fields[x as symbol]!})`).join(", ")} }`;}
+    checkExprType(_: SymTable): Type {
+        return this.toaster;
+    }
+    evalExpr(symTable: SymTable): Value {
+        // if the value is an object, this is a good time to check it and make sure
+        // that its properties match what is expected
+        // first check the constructor
+        if(!(this.cons in this.toaster.constructors)) {
+            throw new Error(`${this.cons.description} is not a constructor for ${this.toaster.toString()}`);
+        }
+        // then check the properties
+        // it should have all of the properties it claims to have
+        // and should not have any properties it does not need
+        const setP = this.toaster.constructors[this.cons]!;
+        const setO = Reflect.ownKeys(this.fields);
+        if(setP.length != setO.length) {
+            throw new Error(`Wrong number of fields (provided ${setO.length}, wanted ${setP.length})`);
+        }
+        const missing = setP.find(key => !(setO.includes(key.name)));
+        if(missing) {
+            throw new Error(`Object is missing a property: ${missing.name.description}`);
+        }
+        // finally, make sure that the types of all properties are correct
+        const wrong = setP.find(key => !(isSameType(this.fields[key.name]!.kind, key.kind, symTable)));
+        if(wrong) {
+            throw new Error(`Field is the wrong type (provided ${this.fields[wrong.name]?.toString()}, wanted ${wrong.kind.toString()})`);
+        }
+        return super.evalExpr(symTable);
+    }
 }
 // get a field of an object
-class PropertyAccess {
+class PropertyAccess implements IExpr {
     constructor(public obj: Expression, public field: symbol) {}
+    toString(): string {return `${this.obj.toString()}.${this.field.description}`};
+    checkExprType(symTable: SymTable): Type {
+        return evalExpr(this, symTable).kind;
+    }
+    evalExpr(symTable: SymTable): Value {
+        const obj = evalExpr(this.obj, symTable);
+        if(!(obj.data instanceof Obj)) {
+            throw new Error(`${this.obj.toString()} is not an object, it is: ${obj.toString()}`);
+        }
+        if(!(this.field in obj.data.fields)) {
+            throw new Error(`That object does not have a field named ${this.field.description}`);
+        }
+        return obj.data.fields[this.field]!;
+    }
 }
 // objects have a special kind of matching that works on their constructors
 // in Lean this is a normal match expression but I'm making it a different thing for convenience
-class Pattern {
+class Pattern implements IExpr {
     constructor(public variable: Expression, public cases: Record<symbol, Expression>) {}
+    toString(): string {return `match(${this.variable.toString()}) { ${Reflect.ownKeys(this.cases).map(x => `${x.toString()} -> ${this.cases[x as symbol]!.toString()}`).join("; ")} }`;}
+    checkExprType(symTable: SymTable) {
+        const keys = Reflect.ownKeys(this.cases) as symbol[];
+        if(keys.length == 0) throw new Error("Pattern has no cases");
+        // the type should be the type of all match arms
+        const arm1 = checkExprType(this.cases[keys[0]!]!, symTable);
+        for(const arm of keys.slice(1)) {
+            const at = checkExprType(this.cases[arm]!, symTable);
+            if(!(isSameType(arm1, at, symTable))) throw new Error(`First pattern returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
+        }
+        return arm1;
+    }
+    evalExpr(symTable: SymTable) {
+        // this is a familiar pattern by now
+        const obj = evalExpr(this.variable, symTable);
+        if(!(obj.data instanceof Obj)) {
+            throw new Error(`${this.variable.toString()} is not an object, it is: ${obj.toString()}`);
+        }
+        // first, ensure all cases are handled
+        const setP = Reflect.ownKeys(obj.data.toaster.constructors) as symbol[];
+        const setO = Reflect.ownKeys(this.cases);
+        if(setP.length != setO.length) {
+            throw new Error(`Wrong number of cases in pattern (provided ${setO.length}, wanted ${setP.length})`);
+        }
+        const missing = setP.find(key => !(setO.includes(key)));
+        if(missing) {
+            throw new Error(`Pattern is missing a case: ${missing.description}`);
+        }
+        return evalExpr(this.cases[obj.data.cons]!, symTable);
+    }
 }
 
 // function for quickly dereferencing a value
@@ -168,44 +384,12 @@ type SymTable = Record<symbol, Value>;
 // try to evaluate a statement, but only for its type
 function checkStmtType(code: Statement, symTable: SymTable): SymTable {
     console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
-    if(code instanceof VarDefinition) {
-        // add the variable with the appropriate type, but with a value of undefined
-        // since it should never need to be evaluated for its value anyway
-        return {...symTable, [code.name]: new Value(new Opaque(undefined), checkExprType(code.value, symTable))};
-    } else if(code instanceof FuncDefinition) {
-        // basically the same as `evalStmt`
-        // again, return undefined as the value
-        const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-        return {...symTable, [code.name]: new Value(new Opaque(undefined), new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
-    }
-    throw new Error("Did not match any path");
+    return code.checkStmtType(symTable);
 }
 // try to evaluate a statement, and return the new symbol table after evaluating
 function evalStmt(code: Statement, symTable: SymTable): SymTable {
     console.info(`Executing '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
-    // do something based on what kind of statement it is
-    if(code instanceof VarDefinition) {
-        // define the variable and add it to the symbol table
-        // throw an error if you try to reinstantiate an existing symbol
-        // cause it's better for things to be const by default
-        // especially important now that closures exist (because they would use the old value)
-        if(code.name in symTable) {
-            throw new Error(`${code.name.description} is already defined`);
-        }
-        return {...symTable, [code.name]: evalExpr(code.value, symTable)};
-    } else if(code instanceof FuncDefinition) {
-        // the whole thing will be stored in the symbol table so it can be called when needed
-        // a variable just stores a value, but a function stores a whole object
-        // when checking the function's return type, it may reference the argument
-        // so the argument should be temporarily added to the symbol table while type-checking
-        const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-        const f = new Func(code.argument, code.definition);
-        // the function captures the current symbol table
-        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
-        f.closureTable = {...symTable};
-        return {...symTable, [code.name]: new Value(f, new FuncType(code.argument.kind, checkExprType(code.definition, symTable2)))};
-    }
-    throw new Error("Did not match any path");
+    return code.evalStmt(symTable);
 }
 const evalStmts = (code: Statement[], symTable: SymTable) => code.reduce((table, stmt) => evalStmt(stmt, table), symTable);
 // try to evaluate an expression, and return its type
@@ -213,68 +397,9 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
     console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     if(typeof code == "symbol") {
         return deref(code, symTable).kind;
-    } else if(code instanceof Thing) {
-        // check which kind of object it is
-        if(code instanceof Opaque) {
-            return Symbol(); // functionally useless, since this is too opaque to say anything about
-        } else if(code instanceof Func) {
-            const symTable2 = {...symTable, [code.argument.name]: new Value(new Opaque(undefined), code.argument.kind)};
-            return new FuncType(code.argument.kind, checkExprType(code.definition, symTable2));
-        } else if(code instanceof ObjClass) {
-            return Symbol.for("Type"); // the type of any class is type
-        } else if(code instanceof Obj) {
-            return code.toaster;
-        }
-        throw new Error(`Unknown Thing: ${code.toString()}`);
-    } else if(code instanceof Call) {
-        // first check the type of the thing we're calling...
-        const vt = checkExprType(code.func, symTable);
-        // ... and that it is a function
-        if(!(vt instanceof FuncType)) {
-            throw new Error(`${code.func.toString()} is not a function type, it is: ${vt.toString()}`);
-        }
-        // now check the type of the argument...
-        const at = checkExprType(code.argument, symTable);
-        // ... and ensure the argument's type is correct
-        if(!(isSameType(at, vt.inType, symTable))) {
-            throw new Error(`Cannot call function of type ${vt.toString()} with argument of type ${at.toString()}`);
-        }
-        // just give the return type
-        return vt.outType;
-    } else if(code instanceof Return) {
-        // evaluate the statements in the `Return` for their types
-        const symTable2 = code.stmts.reduce((table, stmt) => checkStmtType(stmt, table), {...symTable});
-        return checkExprType(code.returns, symTable2);
-    } else if(code instanceof Match) {
-        if(code.cases.length == 0) throw new Error("Match has no arms");
-        // the type should be the type of all match arms
-        const arm1 = checkExprType(code.cases[0]!.rhs, symTable);
-        for(const arm of code.cases.slice(1)) {
-            const at = checkExprType(arm.rhs, symTable);
-            if(!(isSameType(arm1, at, symTable))) throw new Error(`First match arm returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
-        }
-        // check the default case too
-        const defaultCase = checkExprType(code.otherwise, symTable);
-        if(!(isSameType(arm1, defaultCase, symTable))) throw new Error(`First match arm returns type ${arm1.toString()}, but default case returns type ${defaultCase.toString()}`);
-        return arm1;
-    } else if(code instanceof Construct) {
-        // yeah idk how to do this other than just evaluating it
-        return evalExpr(code.toaster, symTable).kind;
-    } else if(code instanceof PropertyAccess) {
-        // see above.
-        return evalExpr(code, symTable).kind;
-    } else if(code instanceof Pattern) {
-        const keys = Reflect.ownKeys(code.cases) as symbol[];
-        if(keys.length == 0) throw new Error("Pattern has no cases");
-        // the type should be the type of all match arms
-        const arm1 = checkExprType(code.cases[keys[0]!]!, symTable);
-        for(const arm of keys.slice(1)) {
-            const at = checkExprType(code.cases[arm]!, symTable);
-            if(!(isSameType(arm1, at, symTable))) throw new Error(`First pattern returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
-        }
-        return arm1;
+    } else {
+        return code.checkExprType(symTable);
     }
-    throw new Error("Did not match any path");
 }
 // try to evaluate an expression, and return its value
 function evalExpr(code: Expression, symTable: SymTable): Value {
@@ -282,114 +407,9 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
     // do something based on what kind of expression it is
     if(typeof code == "symbol") {
         return deref(code, symTable);
-    } else if(code instanceof Thing) {
-        if(code instanceof Func) {
-            // if the value is a function, it captures its context in this moment
-            console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
-            code.closureTable = {...symTable};
-        } else if(code instanceof Obj) {
-            // if the value is an object, this is a good time to check it and make sure
-            // that its properties match what is expected
-            // first check the constructor
-            if(!(code.cons in code.toaster.constructors)) {
-                throw new Error(`${code.cons.description} is not a constructor for ${code.toaster.toString()}`);
-            }
-            // then check the properties
-            // it should have all of the properties it claims to have
-            // and should not have any properties it does not need
-            const setP = code.toaster.constructors[code.cons]!;
-            const setO = Reflect.ownKeys(code.fields);
-            if(setP.length != setO.length) {
-                throw new Error(`Wrong number of fields (provided ${setO.length}, wanted ${setP.length})`);
-            }
-            const missing = setP.find(key => !(setO.includes(key.name)));
-            if(missing) {
-                throw new Error(`Object is missing a property: ${missing.name.description}`);
-            }
-            // finally, make sure that the types of all properties are correct
-            const wrong = setP.find(key => !(isSameType(code.fields[key.name]!.kind, key.kind, symTable)));
-            if(wrong) {
-                throw new Error(`Field is the wrong type (provided ${code.fields[wrong.name]?.toString()}, wanted ${wrong.kind.toString()})`);
-            }
-        }
-        // return the value along with its type
-        return new Value(code, checkExprType(code, symTable));
-    } else if(code instanceof Call) {
-        // first make sure that the thing we're calling is defined...
-        const v = evalExpr(code.func, symTable);
-        // ... and that it is a function
-        if(!(v.data instanceof Func)) {
-            throw new Error(`${code.func.toString()} is not a function, it is: ${v.toString()}`);
-        }
-        const f: Func = v.data;
-        // now evaluate the argument...
-        const a = evalExpr(code.argument, symTable);
-        // ... and ensure the argument's type is correct
-        if(!(isSameType(a.kind, f.argument.kind, symTable))) {
-            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.kind.toString()}`);
-        }
-        // make a copy of the symbol table to add the argument to it
-        // a copy is made because the argument symbols should not be retained after the function call
-        // also add the closure table if the function has one
-        const innerSymTable: SymTable = {...symTable, ...f.closureTable, [f.argument.name]: a};
-        // after filling out the arguments in `innerSymTable`, evaluate it
-        return evalExpr(f.definition, innerSymTable);
-    } else if(code instanceof Return) {
-        // this means statements will get involved.
-        const outTable = code.stmts.reduce((table, stmt) => evalStmt(stmt, table), symTable);
-        return evalExpr(code.returns, outTable);
-    } else if(code instanceof Match) {
-        const v = evalExpr(code.variable, symTable);
-        // call the appropriate expression
-        for(const c of code.cases) {
-            const lhs = evalExpr(c.lhs, symTable);
-            if(isSameValue(v, lhs, symTable)) return evalExpr(c.rhs, symTable);
-        }
-        return evalExpr(code.otherwise, symTable);
-    } else if(code instanceof Construct) {
-        // construct an object
-        // the actual fields of the object will be checked in the `Thing` branch of this function
-        // so no need to do the work twice
-        const cons = evalExpr(code.toaster, symTable);
-        if(!(cons.data instanceof ObjClass)) {
-            throw new Error(`${code.toaster.toString()} is not a class, it is: ${cons.toString()}`);
-        }
-        // evaluate each field
-        const computedFields: Record<symbol, Value> = {};
-        for(const key of Reflect.ownKeys(code.fields)) {
-            computedFields[key as symbol] = evalExpr(code.fields[key as symbol]!, symTable);
-        }
-        return evalExpr(new Obj(cons.data, code.cons, computedFields), symTable);
-    } else if(code instanceof PropertyAccess) {
-        // once again, ensure that the expression is the proper type...
-        const obj = evalExpr(code.obj, symTable);
-        if(!(obj.data instanceof Obj)) {
-            throw new Error(`${code.obj.toString()} is not an object, it is: ${obj.toString()}`);
-        }
-        // ... then attempt to get its field
-        if(!(code.field in obj.data.fields)) {
-            throw new Error(`That object does not have a field named ${code.field.description}`);
-        }
-        return obj.data.fields[code.field]!;
-    } else if(code instanceof Pattern) {
-        // this is a familiar pattern by now
-        const obj = evalExpr(code.variable, symTable);
-        if(!(obj.data instanceof Obj)) {
-            throw new Error(`${code.variable.toString()} is not an object, it is: ${obj.toString()}`);
-        }
-        // first, ensure all cases are handled
-        const setP = Reflect.ownKeys(obj.data.toaster.constructors) as symbol[];
-        const setO = Reflect.ownKeys(code.cases);
-        if(setP.length != setO.length) {
-            throw new Error(`Wrong number of cases in pattern (provided ${setO.length}, wanted ${setP.length})`);
-        }
-        const missing = setP.find(key => !(setO.includes(key)));
-        if(missing) {
-            throw new Error(`Pattern is missing a case: ${missing.description}`);
-        }
-        return evalExpr(code.cases[obj.data.cons]!, symTable);
+    } else {
+        return code.evalExpr(symTable);
     }
-    throw new Error("Did not match any path");
 }
 
 // boolean operations
