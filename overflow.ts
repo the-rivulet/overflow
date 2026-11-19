@@ -2,7 +2,7 @@
 Symbol.prototype.toString = function() { return this.description!; };
 
 // anything that can be evaluated to get a value
-type Expression = symbol | Thing | Call | Return | Match | Construct | PropertyAccess;
+type Expression = symbol | Thing | Call | Return | Match | Construct | PropertyAccess | Pattern;
 // anything that can be evaluated to do something
 type Statement = VarDefinition | FuncDefinition;
 // anything that can be used as a type
@@ -95,6 +95,11 @@ class Obj extends Thing {
 // get a field of an object
 class PropertyAccess {
     constructor(public obj: Expression, public field: symbol) {}
+}
+// objects have a special kind of matching that works on their constructors
+// in Lean this is a normal match expression but I'm making it a different thing for convenience
+class Pattern {
+    constructor(public variable: Expression, public cases: Record<symbol, Expression>) {}
 }
 
 // function for quickly dereferencing a value
@@ -258,6 +263,16 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
     } else if(code instanceof PropertyAccess) {
         // see above.
         return evalExpr(code, symTable).kind;
+    } else if(code instanceof Pattern) {
+        const keys = Reflect.ownKeys(code.cases) as symbol[];
+        if(keys.length == 0) throw new Error("Pattern has no cases");
+        // the type should be the type of all match arms
+        const arm1 = checkExprType(code.cases[keys[0]!]!, symTable);
+        for(const arm of keys.slice(1)) {
+            const at = checkExprType(code.cases[arm]!, symTable);
+            if(!(isSameType(arm1, at, symTable))) throw new Error(`First pattern returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
+        }
+        return arm1;
     }
     throw new Error("Did not match any path");
 }
@@ -356,6 +371,23 @@ function evalExpr(code: Expression, symTable: SymTable): Value {
             throw new Error(`That object does not have a field named ${code.field.description}`);
         }
         return obj.data.fields[code.field]!;
+    } else if(code instanceof Pattern) {
+        // this is a familiar pattern by now
+        const obj = evalExpr(code.variable, symTable);
+        if(!(obj.data instanceof Obj)) {
+            throw new Error(`${code.variable.toString()} is not an object, it is: ${obj.toString()}`);
+        }
+        // first, ensure all cases are handled
+        const setP = Reflect.ownKeys(obj.data.toaster.constructors) as symbol[];
+        const setO = Reflect.ownKeys(code.cases);
+        if(setP.length != setO.length) {
+            throw new Error(`Wrong number of cases in pattern (provided ${setO.length}, wanted ${setP.length})`);
+        }
+        const missing = setP.find(key => !(setO.includes(key)));
+        if(missing) {
+            throw new Error(`Pattern is missing a case: ${missing.description}`);
+        }
+        return evalExpr(code.cases[obj.data.cons]!, symTable);
     }
     throw new Error("Did not match any path");
 }
@@ -402,7 +434,7 @@ console.log(evalExpr(new Call(new Call(_orMeta, _true), _false), boolTable).toSt
 // object testing
 const _Nat = Symbol("Nat"), _zero = Symbol("zero"), _succ = Symbol("succ"), _prev = Symbol("prev");
 const _0 = Symbol("0"), _anotherZero = Symbol("anotherZero"), _1 = Symbol("1"), _2 = Symbol("2");
-const _is0 = Symbol("is0"), _num = Symbol("num");
+const _is0 = Symbol("is0"), _anotherIs0 = Symbol("anotherIs0"), _num = Symbol("num");
 const natNumbers = [
     new VarDefinition(_Nat, new ObjClass({
         [_zero]: [],
@@ -414,8 +446,26 @@ const natNumbers = [
     new VarDefinition(_2, new Construct(_Nat, _succ, {[_prev]: _1})),
     new FuncDefinition(_is0, new Identifier(_num, _Nat), new Match(_num, [
         new MatchCase(_0, _true)
-    ], _false))
-]
+    ], _false)),
+    new FuncDefinition(_anotherIs0, new Identifier(_num, _Nat), new Pattern(_num, {
+        [_zero]: _true,
+        [_succ]: _false
+    }))
+];
+
 const natTable = evalStmts(natNumbers, boolTable);
+function makeNat(from: number): Value {
+    const num = Math.abs(Math.floor(from)); // make it a nonnegative integer if it isn't already
+    if(num == 0) return evalExpr(_0, natTable);
+    else return evalExpr(new Construct(_Nat, _succ, {[_prev]: makeNat(num - 1).data}), natTable);
+}
+function parseNat(code: Expression, symTable: SymTable): number {
+    const value = evalExpr(code, symTable).data as Obj;
+    if(value.cons == _zero) return 0;
+    else return 1 + parseNat(value.fields[_prev]!.data, symTable);
+}
+console.log(parseNat(makeNat(10).data, natTable).toString());
+
 console.log(evalExpr(new Call(_is0, _anotherZero), natTable).toString());
+console.log(evalExpr(new Call(_anotherIs0, _1), natTable).toString());
 console.log(evalExpr(new Construct(_Nat, _succ, {[_prev]: new PropertyAccess(_2, _prev)}), natTable).toString());
