@@ -30,10 +30,10 @@ abstract class Thing implements IExpr {
 }
 
 // opaque values, used for passing in external arguments
-class Opaque extends Thing {
+class OpaqueThing extends Thing {
     constructor(public data: any) { super(); }
     toString() {return `opaque "${this.data.toString()}"`;}
-    isSameThing(b: Thing, symTable: SymTable): boolean { return b instanceof Opaque && this.data == b.data; }
+    isSameThing(b: Thing, symTable: SymTable): boolean { return b instanceof OpaqueThing && this.data == b.data; }
     checkExprType(_: SymTable): Type { return Symbol(); /* basically useless since it's Opaque */ }
 }
 // a name with its type
@@ -75,11 +75,13 @@ class Call implements IExpr {
             throw new Error(`${this.func.toString()} is not a function, it is: ${v.toString()}`);
         }
         const f: Func = v.data;
+        // use the closure table
+        const fullTable = {...symTable, ...f.closureTable};
         // now evaluate the argument...
-        const a = evalExpr(this.argument, symTable);
+        const a = evalExpr(this.argument, fullTable);
         // ... and ensure the argument's type is correct
-        if(!(isSameType(a.kind, f.argument.kind, symTable))) {
-            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.kind.toString()}`);
+        if(!(isSameType(a.kind, f.argument.kind, fullTable))) {
+            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.toString()}`);
         }
         // make a copy of the symbol table to add the argument to it
         // a copy is made because the argument symbols should not be retained after the function call
@@ -96,7 +98,7 @@ class VarDefinition implements IStmt {
     constructor(public name: symbol, public value: Expression) {}
     toString() {return `${this.name.description} = ${this.value.toString()}`;}
     checkStmtType(symTable: SymTable): SymTable {
-        return {...symTable, [this.name]: new Value(new Opaque(undefined), checkExprType(this.value, symTable))};
+        return {...symTable, [this.name]: new Value(new OpaqueThing(undefined), checkExprType(this.value, symTable))};
     }
     evalStmt(symTable: SymTable): SymTable {
         // define the variable and add it to the symbol table
@@ -129,18 +131,17 @@ class FuncDefinition implements IStmt {
     constructor(public name: symbol, public argument: Identifier, public definition: Expression) {}
     toString() {return `fn ${this.name.description}(${this.argument.toString()}) { ${this.definition.toString()} }`;}
     checkStmtType(symTable: SymTable): SymTable {
-        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
-        return {...symTable, [this.name]: new Value(new Opaque(undefined), new FuncType(this.argument.kind, checkExprType(this.definition, symTable2)))};
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new OpaqueThing(undefined), this.argument.kind)};
+        return {...symTable, [this.name]: new Value(new OpaqueThing(undefined), new FuncType(this.argument.kind, checkExprType(this.definition, symTable2)))};
     }
     evalStmt(symTable: SymTable): SymTable {
         // the whole thing will be stored in the symbol table so it can be called when needed
         // a variable just stores a value, but a function stores a whole object
         // when checking the function's return type, it may reference the argument
         // so the argument should be temporarily added to the symbol table while type-checking
-        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new OpaqueThing(undefined), this.argument.kind)};
         const f = new Func(this.argument, this.definition);
         // the function captures the current symbol table
-        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
         f.closureTable = {...symTable};
         return {...symTable, [this.name]: new Value(f, new FuncType(this.argument.kind, checkExprType(this.definition, symTable2)))};
     }
@@ -154,11 +155,11 @@ class Func extends Thing {
     toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
     isSameThing(b: Thing, symTable: SymTable): boolean { return false; }
     checkExprType(symTable: SymTable): Type {
-        const symTable2 = {...symTable, [this.argument.name]: new Value(new Opaque(undefined), this.argument.kind)};
+        const symTable2 = {...symTable, [this.argument.name]: new Value(new OpaqueThing(undefined), this.argument.kind)};
         return new FuncType(this.argument.kind, checkExprType(this.definition, symTable2));
     }
     evalExpr(symTable: SymTable): Value {
-        console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+        //console.info(`Adding a closure table: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
         this.closureTable = {...symTable};
         return super.evalExpr(symTable);
     }
@@ -212,6 +213,8 @@ class ObjClass extends Thing implements IType {
     toString() {return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`);}
     isSameThing(b: Thing, symTable: SymTable): boolean {
         // classes are equal if their structures are the same
+        // generally `isSameThing` will be identical to `isSameType` if the latter exists
+        // because that means they can be compared as things OR as types
         return b instanceof ObjClass && isSameType(this, b, symTable);
     }
     checkExprType(_: SymTable): Type {
@@ -349,6 +352,27 @@ class Pattern implements IExpr {
     }
 }
 
+// propositions!!!! finally we're getting to the "proving" part of the program
+// the type "Prop" cannot be constructed
+// TODO: find a way to make it different from any other type with no constructors
+const TProp = new ObjClass({}, "Prop");
+abstract class Proposition extends Thing implements IType {
+    // isSameType(b: Type, symTable: SymTable): boolean;
+    abstract isSameType(b: Type, symTable: SymTable): boolean;
+    isSameThing(b: Thing, symTable: SymTable) {
+        // once again, `isSameThing` is equal to `isSameType` if the latter exists
+        return b instanceof Proposition && this.isSameType(b, symTable);
+    }
+    checkExprType(_: SymTable) {
+        return TProp; // the type of any proposition is "Prop"
+    }
+}
+class OpaqueProp extends Proposition {
+    constructor(public data: any) { super(); }
+    toString() {return `proposition "${this.data.toString()}"`;}
+    isSameType(b: Type, symTable: SymTable): boolean { return b instanceof OpaqueProp && this.data == b.data; }
+}
+
 // function for quickly dereferencing a value
 function deref(code: symbol, symTable: SymTable) {
     if(!(code in symTable)) {
@@ -358,17 +382,19 @@ function deref(code: symbol, symTable: SymTable) {
     return symTable[code]!;
 }
 // utility function for checking whether types match
-function isSameType(at: Type, bt: Type, symTable: SymTable): boolean {
-    console.info(`Comparing types of ${at.toString()} and ${bt.toString()}`);
-    // deref if needed
-    // this may lead to infinite loops if comparing two classes with identically-named fields
-    // where one is a class literal and the other is a symbol that dereferences to a class containing itself
-    // that seems like a rare situation though so I will ignore it for now
-    if(typeof at == "symbol" && typeof bt == "symbol") return at == bt;
+// this results in infinite loops sometimes so as a stopgap measure I'm adding a hard limit on iter count
+function isSameType(at: Type, bt: Type, symTable: SymTable, iters = 0): boolean {
+    if(iters >= 10) {
+        console.warn("Evaluated too deep while checking types");
+        return false;
+    }
+    //console.info(`Comparing types of ${at.toString()} and ${bt.toString()}`);
+    // deref
+    if(typeof at == "symbol" && typeof bt == "symbol" && at == bt) return true;
     const a = (typeof at == "symbol") ? deref(at, symTable).data as unknown as IType : at;
     const b = (typeof bt == "symbol") ? deref(bt, symTable).data as unknown as IType : bt;
-    // compare
-    return a.isSameType(b, symTable);
+    // compare, dereferencing recursively if necessary
+    return (a == at && b == bt) ? a.isSameType(b, symTable) : isSameType(a, b, symTable, iters + 1);
 }
 // function for checking whether values match
 function isSameThing(a: Thing, b: Thing, symTable: SymTable): boolean {
@@ -385,18 +411,18 @@ type SymTable = Record<symbol, Value>;
 
 // try to evaluate a statement, but only for its type
 function checkStmtType(code: Statement, symTable: SymTable): SymTable {
-    console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
+    //console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     return code.checkStmtType(symTable);
 }
 // try to evaluate a statement, and return the new symbol table after evaluating
 function evalStmt(code: Statement, symTable: SymTable): SymTable {
-    console.info(`Executing '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
+    //console.info(`Executing '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     return code.evalStmt(symTable);
 }
 const evalStmts = (code: Statement[], symTable: SymTable) => code.reduce((table, stmt) => evalStmt(stmt, table), symTable);
 // try to evaluate an expression, and return its type
 function checkExprType(code: Expression, symTable: SymTable): Type {
-    console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
+    //console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     if(typeof code == "symbol") {
         return deref(code, symTable).kind;
     } else {
@@ -405,7 +431,7 @@ function checkExprType(code: Expression, symTable: SymTable): Type {
 }
 // try to evaluate an expression, and return its value
 function evalExpr(code: Expression, symTable: SymTable): Value {
-    console.info(`Evaluating '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
+    //console.info(`Evaluating '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
     // do something based on what kind of expression it is
     if(typeof code == "symbol") {
         return deref(code, symTable);
@@ -491,3 +517,17 @@ console.log(parseNat(makeNat(10).data, natTable).toString());
 console.log(evalExpr(new Call(_is0, _anotherZero), natTable).toString());
 console.log(evalExpr(new Call(_anotherIs0, _1), natTable).toString());
 console.log(evalExpr(new Construct(_Nat, _succ, {[_prev]: new PropertyAccess(_2, _prev)}), natTable).toString());
+
+// proposition testing
+const _refl = Symbol("refl"), _P = Symbol("P"), _p = Symbol("p"), _a = Symbol("a"), _A = Symbol("A"), _b = Symbol("b"), _B = Symbol("B");
+console.log(evalExpr(
+    new Return([
+        new FuncDefinition(_refl, new Identifier(_P, TProp), new Func(new Identifier(_p, _P), _p))
+    ], new Call(new Call(_refl, _B), _b)),
+    {
+        [_A]: new Value(new OpaqueProp("some proposition"), TProp),
+        [_a]: new Value(new OpaqueThing(1), _A),
+        [_B]: new Value(new OpaqueProp("another proposition"), TProp),
+        [_b]: new Value(new OpaqueThing(2), _B)
+    }
+).toString());
