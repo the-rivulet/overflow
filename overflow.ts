@@ -44,7 +44,17 @@ class Identifier {
 // a value with its type
 class Value {
     constructor(public data: Thing, public kind: Type) {}
-    toString() {return `${this.data} : ${this.kind.toString()}`;}
+    toString() {
+        // if this is a `Func`, its type might be hidden in its closure table, making it harder to understand
+        // so, if it is, try to evaluate it
+        if(this.data instanceof Func && this.kind instanceof FuncType) {
+            const ctable = this.data.closureTable, i = this.kind.inType, o = this.kind.outType;
+            const i2 = (typeof i == "symbol" && i in ctable) ? ctable[i]?.data as unknown as IType : i;
+            const o2 = (typeof o == "symbol" && o in ctable) ? ctable[o]?.data as unknown as IType : o;
+            return `${this.data} : ${new FuncType(i2, o2).toString()}`
+        }
+        return `${this.data} : ${this.kind.toString()}`;
+    }
 }
 
 // calling a function on arguments
@@ -81,7 +91,14 @@ class Call implements IExpr {
         const a = evalExpr(this.argument, fullTable);
         // ... and ensure the argument's type is correct
         if(!(isSameType(a.kind, f.argument.kind, fullTable))) {
-            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.toString()}`);
+            // when throwing an error in this way, try to use the closure table to change the argument type
+            // into a more specific one. (it is not useful to see "expected T, got..." when you don't know what T is)
+            if(typeof f.argument.kind == "symbol" && f.argument.kind in f.closureTable) {
+                throw new Error(`Expected an argument of type ${f.argument.kind.toString()} (${f.closureTable[f.argument.kind]?.data?.toString()}), but got ${a.toString()}`);
+            } else {
+                // if it didn't work, that's ok too.
+                throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.toString()}`);
+            }
         }
         // make a copy of the symbol table to add the argument to it
         // a copy is made because the argument symbols should not be retained after the function call
@@ -152,8 +169,21 @@ class FuncDefinition implements IStmt {
 class Func extends Thing {
     closureTable: SymTable;
     constructor(public argument: Identifier, public definition: Expression) { super(); this.closureTable = {}; }
-    toString(): string {return `(${this.argument.toString()}) => { ${this.definition.toString()} }`;}
-    isSameThing(b: Thing, symTable: SymTable): boolean { return false; }
+    toString(): string {
+        // when stringifying a function, use its closure table to resolve types before printing them
+        // so that a more helpful type can be given
+        /*if(typeof f.argument.kind == "symbol" && f.argument.kind in f.closureTable) {
+            throw new Error(`Expected an argument of type ${f.argument.kind.toString()} (${fullTable[f.argument.kind]?.data?.toString()}), but got ${a.toString()}`);
+        } else {
+            // if it didn't work, that's ok too.
+            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.toString()}`);
+        }*/
+        const argType = (typeof this.argument.kind == "symbol" && this.argument.kind in this.closureTable)
+            ? this.closureTable[this.argument.kind]?.data as unknown as IType
+            : this.argument.kind;
+        return `(${new Identifier(this.argument.name, argType).toString()}) => { ${this.definition.toString()} }`;
+    }
+    isSameThing(_b: Thing, _symTable: SymTable): boolean { return false; }
     checkExprType(symTable: SymTable): Type {
         const symTable2 = {...symTable, [this.argument.name]: new Value(new OpaqueThing(undefined), this.argument.kind)};
         return new FuncType(this.argument.kind, checkExprType(this.definition, symTable2));
