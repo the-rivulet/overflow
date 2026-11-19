@@ -383,10 +383,16 @@ class Pattern implements IExpr {
 }
 
 // propositions!!!! finally we're getting to the "proving" part of the program
-// the type "Prop" cannot be constructed
-// TODO: find a way to make it different from any other type with no constructors
-const TProp = new ObjClass({}, "Prop");
-abstract class Proposition extends Thing implements IType {
+class NonconstructibleObjClass extends ObjClass {
+    // each item in `constructors` is one way to construct this object
+    constructor(private secretKey: symbol) { super({}, secretKey.description); }
+    isSameType(b: Type, _: SymTable): boolean {
+        return b instanceof NonconstructibleObjClass && this.secretKey == b.secretKey;
+    }
+}
+const TProp = new NonconstructibleObjClass(Symbol("TProp"));
+abstract class Proposition extends NonconstructibleObjClass implements IType {
+    constructor() { super(Symbol("Prop")); }
     // isSameType(b: Type, symTable: SymTable): boolean;
     abstract isSameType(b: Type, symTable: SymTable): boolean;
     isSameThing(b: Thing, symTable: SymTable) {
