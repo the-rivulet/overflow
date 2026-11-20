@@ -19,6 +19,10 @@ type Type = symbol | IType;
 interface IType {
     isSameType(b: Type, symTable: SymTable): boolean;
 }
+function asType(x: IExpr) {
+    if(!("isSameType" in x)) throw new Error(`${x.toString()} isn't even remotely like a Type`);
+    return x as unknown as IType;
+}
 
 abstract class Thing implements IExpr {
     private readonly _thing!: void;
@@ -26,10 +30,6 @@ abstract class Thing implements IExpr {
     abstract checkExprType(symTable: SymTable): Type;
     evalExpr(symTable: SymTable): Value {
         return new Value(this, checkExprType(this, symTable));
-    }
-    asType(): IType {
-        if(!("isSameType" in this)) throw new Error(`${this.toString()} isn't even remotely like a Type`);
-        return this as unknown as IType;
     }
 }
 
@@ -53,8 +53,8 @@ class Value {
         // so, if it is, try to evaluate it
         if(this.data instanceof Func && this.kind instanceof FuncType) {
             const ctable = this.data.closureTable, i = this.kind.inType, o = this.kind.outType;
-            const i2 = (typeof i == "symbol" && i in ctable) ? ctable[i]!.data.asType() : i;
-            const o2 = (typeof o == "symbol" && o in ctable) ? ctable[o]!.data.asType() : o;
+            const i2 = (typeof i == "symbol" && i in ctable) ? asType(ctable[i]!.data) : i;
+            const o2 = (typeof o == "symbol" && o in ctable) ? asType(ctable[o]!.data) : o;
             return `${this.data.toString()} : ${new FuncType(i2, o2).toString()}`
         }
         return `${this.data} : ${this.kind.toString()}`;
@@ -175,7 +175,7 @@ class Func extends Thing {
         // when stringifying a function, use its closure table to resolve types before printing them
         // so that a more helpful type can be given
         const argType = (typeof this.argument.kind == "symbol" && this.argument.kind in this.closureTable)
-            ? this.closureTable[this.argument.kind]!.data.asType()
+            ? asType(this.closureTable[this.argument.kind]!.data)
             : this.argument.kind;
         return `(${new Identifier(this.argument.name, argType).toString()}) => { ${this.definition.toString()} }`;
     }
@@ -195,6 +195,16 @@ class FuncType implements IType {
     toString(): string {return `(${this.inType.toString()} => ${this.outType.toString()})`;}
     isSameType(b: Type, symTable: SymTable): boolean {
         return b instanceof FuncType && isSameType(this.inType, b.inType, symTable) && isSameType(this.outType, b.outType, symTable);
+    }
+}
+// an expression that evaluates to a type
+// this allows expressions to be converted to a type at runtime
+// useful for types that take generics
+class ComputedType implements IType {
+    constructor(public expression: Expression) {}
+    toString(): string { return this.expression.toString(); }
+    isSameType(b: Type, symTable: SymTable): boolean {
+        return isSameType(resolveType(this, symTable), b, symTable);
     }
 }
 // match-expressions, the fundamental control flow pattern
@@ -232,7 +242,7 @@ class Match implements IExpr {
 // objects are a very useful type, because they allow "more types" to be created.
 // objects hold a collection of named and typed values
 // `ObjClass` is like `Func` ... in that it is a `Thing`.
-// the type of every `ObjClass` is a special type: `Symbol.for("Type")`
+// the type of every `ObjClass` is a special type: `UniverseType`.
 class ObjClass extends Thing implements IType {
     // oh no not more closure tables...
     // yeah it turns out that factory functions (... => Type) might need them
@@ -247,7 +257,7 @@ class ObjClass extends Thing implements IType {
             const ids = this.constructors[key as symbol]!;
             reFields[key as symbol] = ids.map(id => new Identifier(
                 id.name,
-                (typeof id.kind == "symbol" && id.kind in ctable) ? ctable[id.kind]!.data.asType() : id.kind
+                (typeof id.kind == "symbol" && id.kind in ctable) ? asType(ctable[id.kind]!.data) : id.kind
             ));
         }
         return "class " + (this.debugName ? `${this.debugName}${this.debugFields.length ? `<${this.debugFields.map(x => evalExpr(x, this.closureTable).data.toString().replace("class ", "")).join(", ")}>` : ""}` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
@@ -398,15 +408,55 @@ class PropertyAccess implements IExpr {
 class Pattern implements IExpr {
     constructor(public variable: Expression, public cases: Record<symbol, Expression>) {}
     toString(): string {return `match(${this.variable.toString()}) { ${Reflect.ownKeys(this.cases).map(x => `${x.toString()} -> ${this.cases[x as symbol]!.toString()}`).join("; ")} }`;}
-    checkExprType(symTable: SymTable) {
-        const keys = Reflect.ownKeys(this.cases) as symbol[];
-        if(keys.length == 0) throw new Error("Pattern has no cases");
-        // the type should be the type of all match arms
-        const arm1 = checkExprType(this.cases[keys[0]!]!, symTable);
-        for(const arm of keys.slice(1)) {
-            const at = checkExprType(this.cases[arm]!, symTable);
-            if(!(accepts(at, arm1, symTable))) throw new Error(`First pattern returns type ${arm1.toString()}, but another arm returns type ${at.toString()}`);
+    checkArm(toasterType: ObjClass, key: symbol, vtype: Type, symTable: SymTable, arm1?: Type) {
+        // this function is getting too big so I'm moving it into a helper
+        const armTable = {...symTable};
+        // yeah we will have to deal with the closure table again
+        if(typeof this.variable == "symbol") {
+            const fields: Record<symbol, Value> = {};
+            // re-add all of the fields, resolving them using the closure table as we go
+            for(const field of toasterType.constructors[key]!) {
+                const k = field.kind;
+                // check if it was captured
+                // if it was, "un-capture" it by finding the identifier in the symbol table that
+                // corresponds to it (using `==` instead of `isSameValue` for *exact* equality)
+                const wasCaptured = typeof k == "symbol" && k in toasterType.closureTable && (Reflect.ownKeys(symTable) as symbol[]).find(
+                    name => symTable[name] == toasterType.closureTable[k]!
+                );
+                fields[field.name] = new Value(new OpaqueThing(undefined), wasCaptured || k);
+            }
+            armTable[this.variable] = new Value(new Obj(toasterType, key, fields), vtype);
         }
+
+        const armType = checkExprType(this.cases[key]!, armTable);
+
+        if(arm1 && !accepts(armType, arm1, armTable)) {
+            throw new Error(`First pattern returns type ${arm1.toString()}, but another arm returns type ${armType.toString()}`);
+        }
+        return armType;
+    }
+    checkExprType(symTable: SymTable) {        
+        // resolve the type of the matched variable
+        const variableType = checkExprType(this.variable, symTable);
+        const toaster = resolveType(variableType, symTable);
+        if(!(toaster instanceof ObjClass)) {
+            throw new Error(`Cannot pattern-match ${this.variable.toString()} because its type is not an object class`);
+        }
+        // make sure every constructor is covered.
+        const keys = Reflect.ownKeys(this.cases) as symbol[];
+        const constructors = Reflect.ownKeys(toaster.constructors) as symbol[];
+        if(constructors.length != keys.length) {
+            throw new Error(`Wrong number of cases in pattern (provided ${keys.length}, wanted ${constructors.length})`);
+        }
+        const missing = constructors.find(key => !keys.includes(key));
+        if(missing) {
+            throw new Error(`Pattern is missing a case: ${missing.description}`);
+        }
+        // also check that every arm returns the same type
+        // just like a regular `Match`
+        if(!keys.length) throw new Error(`Why are you trying to match ${this.variable.toString()} which has no constructors`);
+        let arm1 = this.checkArm(toaster, keys[0]!, variableType, symTable);
+        for(const cons of keys.slice(1)) this.checkArm(toaster, cons, variableType, symTable, arm1);
         return arm1;
     }
     evalExpr(symTable: SymTable) {
@@ -416,12 +466,12 @@ class Pattern implements IExpr {
             throw new Error(`${this.variable.toString()} is not an object, it is: ${obj.toString()}`);
         }
         // first, ensure all cases are handled
-        const setP = Reflect.ownKeys(obj.data.toaster.constructors) as symbol[];
-        const setO = Reflect.ownKeys(this.cases);
-        if(setP.length != setO.length) {
-            throw new Error(`Wrong number of cases in pattern (provided ${setO.length}, wanted ${setP.length})`);
+        const constructors = Reflect.ownKeys(obj.data.toaster.constructors) as symbol[];
+        const keys = Reflect.ownKeys(this.cases);
+        if(constructors.length != keys.length) {
+            throw new Error(`Wrong number of cases in pattern (provided ${keys.length}, wanted ${constructors.length})`);
         }
-        const missing = setP.find(key => !(setO.includes(key)));
+        const missing = constructors.find(key => !keys.includes(key));
         if(missing) {
             throw new Error(`Pattern is missing a case: ${missing.description}`);
         }
@@ -478,6 +528,14 @@ function deref(code: symbol, symTable: SymTable) {
     // otherwise return whatever it was
     return symTable[code]!;
 }
+// dereference and evaluate computed types
+function resolveType(type: Type, symTable: SymTable) {
+    // symbols get dereferenced
+    if(typeof type == "symbol") return asType(deref(type, symTable).data);
+    // computed types get evaluated
+    if(type instanceof ComputedType) return asType(evalExpr(type.expression, symTable).data);
+    return type;
+}
 // utility function for checking whether types match
 // this results in infinite loops sometimes so as a stopgap measure I'm adding a hard limit on iter count
 function isSameType(at: Type, bt: Type, symTable: SymTable, iters = 0): boolean {
@@ -485,11 +543,10 @@ function isSameType(at: Type, bt: Type, symTable: SymTable, iters = 0): boolean 
         console.warn("Evaluated too deep while checking types");
         return false;
     }
-    //console.info(`Comparing types of ${at.toString()} and ${bt.toString()}`);
-    // deref
+    // resolve types to their underlying values
     if(typeof at == "symbol" && typeof bt == "symbol" && at == bt) return true;
-    const a = (typeof at == "symbol") ? deref(at, symTable).data.asType() : at;
-    const b = (typeof bt == "symbol") ? deref(bt, symTable).data.asType() : bt;
+    const a = resolveType(at, symTable);
+    const b = resolveType(bt, symTable);
     // compare, dereferencing recursively if necessary
     return (a == at && b == bt) ? a.isSameType(b, symTable) : isSameType(a, b, symTable, iters + 1);
 }
@@ -632,16 +689,16 @@ console.log(evalExpr(
     new Construct(new Call(new Call(_Or, _Bool), _Nat), _OrL, {[_value]: _true}),
     {...natTable, ...orTable}
 ).toString());
-const _And = Symbol("And"), _And1 = Symbol("And1"), _And2 = Symbol("And2"), _And_intro = Symbol("And_intro"), _fst = Symbol("fst"), _snd = Symbol("snd");
+const _And = Symbol("And"), _And1 = Symbol("And1"), _And2 = Symbol("And2"), _fst = Symbol("fst"), _snd = Symbol("snd");
 const andClass = new FuncDefinition(_And, new Identifier(_And1, Any), new Func(
     new Identifier(_And2, Any),
     new ObjClass({
-        [_And_intro]: [new Identifier(_fst, _And1), new Identifier(_snd, _And2)],
+        [_And]: [new Identifier(_fst, _And1), new Identifier(_snd, _And2)],
     }, "And", [_And1, _And2])
 ));
 const andTable = evalStmts([andClass], {});
 console.log(evalExpr(
-    new Construct(new Call(new Call(_And, _Bool), _Nat), _And_intro, {[_fst]: _true, [_snd]: _1}),
+    new Construct(new Call(new Call(_And, _Bool), _Nat), _And, {[_fst]: _true, [_snd]: _1}),
     {...natTable, ...andTable}
 ).toString());
 
@@ -660,8 +717,32 @@ console.log(evalExpr(
     new Return([
         new FuncDefinition(_andAuto, new Identifier(_a1, Any), new Func(
             new Identifier(_a2, Any),
-            new Construct(new Call(new Call(_And, new Toaster(_a1)), new Toaster(_a2)), _And_intro, {[_fst]: _a1, [_snd]: _a2})
+            new Construct(new Call(new Call(_And, new Toaster(_a1)), new Toaster(_a2)), _And, {[_fst]: _a1, [_snd]: _a2})
         ))
     ], new Call(new Call(_andAuto, _0), _false)),
     {...natTable, ...andTable}
+).toString());
+
+// functions can take `And`s and `Or`s
+const _Or_elim = Symbol("Or_elim"), _Oe1 = Symbol("oe1"), _Oe2 = Symbol("oe2"), _orX = Symbol("X"), _Target = Symbol("Target"), _imp1 = Symbol("imp1"), _imp2 = Symbol("imp2");
+console.log(evalExpr(
+    new Return([
+        new FuncDefinition(_Or_elim, new Identifier(_Oe1, Any), new Func(
+            new Identifier(_Oe2, Any), new Func(
+                new Identifier(_Target, Any), new Func(
+                    new Identifier(_orX, new ComputedType(new Call(new Call(_Or, _Oe1), _Oe2))), new Func(
+                        new Identifier(_imp1, new FuncType(_Oe1, _Target)), new Func(
+                            new Identifier(_imp2, new FuncType(_Oe2, _Target)), new Pattern(
+                                _orX, {
+                                    [_OrL]: new Call(_imp1, new PropertyAccess(_orX, _value)),
+                                    [_OrR]: new Call(_imp2, new PropertyAccess(_orX, _value))
+                                }
+                            )
+                        )
+                    )
+                )
+            )
+        ))
+    ], _Or_elim),
+    {...orTable}
 ).toString());
