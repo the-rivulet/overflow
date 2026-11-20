@@ -306,7 +306,10 @@ class Construct implements IExpr {
 // so in `evalExpr` we just have to make sure they're sound before they get actually used
 class Obj extends Thing {
     constructor(public toaster: ObjClass, public cons: symbol, public fields: Record<symbol, Value>) { super(); }
-    toString() {return `object ${this.cons.description} { ${Reflect.ownKeys(this.fields).map(x => `${x.toString()} (${this.fields[x as symbol]!})`).join(", ")} }`;}
+    toString() {
+        if(Reflect.ownKeys(this.fields).length == 0) return `object ${this.cons.description}`;
+        else return `object ${this.cons.description} { ${Reflect.ownKeys(this.fields).map(x => `${x.toString()} (${this.fields[x as symbol]!})`).join(", ")} }`;
+    }
     isSameThing(b: Thing, symTable: SymTable): boolean {
         // objects are equal if all their fields are equal
         // and they were constructed from the same constructor
@@ -574,20 +577,30 @@ console.log(evalExpr(new Call(_anotherIs0, _1), natTable).toString());
 console.log(evalExpr(new Construct(_Nat, _succ, {[_prev]: new PropertyAccess(_2, _prev)}), natTable).toString());
 
 // advanced object testing
-const _Or = Symbol("Or"), _Or1 = Symbol("Or1"), _Or2 = Symbol("Or2"), _OrL = Symbol("OrL"), _OrR = Symbol("OrR"), _OrA = Symbol("OrA"), _OrB = Symbol("OrB");
-const orClass = [
-    new FuncDefinition(_Or, new Identifier(_Or1, Symbol.for("Type")), new Func(
-        new Identifier(_Or2, Symbol.for("Type")),
-        new ObjClass({
-            [_OrL]: [new Identifier(_OrA, _Or1)],
-            [_OrR]: [new Identifier(_OrB, _Or2)]
-        })
-    ))
-];
-const orTable = evalStmts(orClass, {});
+const _Or = Symbol("Or"), _Or1 = Symbol("Or1"), _Or2 = Symbol("Or2"), _OrL = Symbol("OrL"), _OrR = Symbol("OrR"), _value = Symbol("value");
+const orClass = new FuncDefinition(_Or, new Identifier(_Or1, Symbol.for("Type")), new Func(
+    new Identifier(_Or2, Symbol.for("Type")),
+    new ObjClass({
+        [_OrL]: [new Identifier(_value, _Or1)],
+        [_OrR]: [new Identifier(_value, _Or2)]
+    })
+));
+const orTable = evalStmts([orClass], {});
 console.log(evalExpr(
-    new Call(new Call(_Or, _Bool), _Nat),
+    new Construct(new Call(new Call(_Or, _Bool), _Nat), _OrL, {[_value]: _true}),
     {...natTable, ...orTable}
+).toString());
+const _And = Symbol("And"), _And1 = Symbol("And1"), _And2 = Symbol("And2"), _And_intro = Symbol("And_intro"), _fst = Symbol("fst"), _snd = Symbol("snd");
+const andClass = new FuncDefinition(_And, new Identifier(_And1, Symbol.for("Type")), new Func(
+    new Identifier(_And2, Symbol.for("Type")),
+    new ObjClass({
+        [_And]: [new Identifier(_fst, _And1), new Identifier(_snd, _And2)],
+    })
+));
+const andTable = evalStmts([andClass], {});
+console.log(evalExpr(
+    new Construct(new Call(new Call(_And, _Bool), _Nat), _And, {[_fst]: _true, [_snd]: _1}),
+    {...natTable, ...andTable}
 ).toString());
 
 // proposition testing
