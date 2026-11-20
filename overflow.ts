@@ -27,6 +27,10 @@ abstract class Thing implements IExpr {
     evalExpr(symTable: SymTable): Value {
         return new Value(this, checkExprType(this, symTable));
     }
+    asType(): IType {
+        if(!("isSameType" in this)) throw new Error(`${this.toString()} isn't even remotely like a Type`);
+        return this as unknown as IType;
+    }
 }
 
 // opaque values, used for passing in external arguments
@@ -49,9 +53,9 @@ class Value {
         // so, if it is, try to evaluate it
         if(this.data instanceof Func && this.kind instanceof FuncType) {
             const ctable = this.data.closureTable, i = this.kind.inType, o = this.kind.outType;
-            const i2 = (typeof i == "symbol" && i in ctable) ? ctable[i]?.data as unknown as IType : i;
-            const o2 = (typeof o == "symbol" && o in ctable) ? ctable[o]?.data as unknown as IType : o;
-            return `${this.data} : ${new FuncType(i2, o2).toString()}`
+            const i2 = (typeof i == "symbol" && i in ctable) ? ctable[i]!.data.asType() : i;
+            const o2 = (typeof o == "symbol" && o in ctable) ? ctable[o]!.data.asType() : o;
+            return `${this.data.toString()} : ${new FuncType(i2, o2).toString()}`
         }
         return `${this.data} : ${this.kind.toString()}`;
     }
@@ -172,14 +176,8 @@ class Func extends Thing {
     toString(): string {
         // when stringifying a function, use its closure table to resolve types before printing them
         // so that a more helpful type can be given
-        /*if(typeof f.argument.kind == "symbol" && f.argument.kind in f.closureTable) {
-            throw new Error(`Expected an argument of type ${f.argument.kind.toString()} (${fullTable[f.argument.kind]?.data?.toString()}), but got ${a.toString()}`);
-        } else {
-            // if it didn't work, that's ok too.
-            throw new Error(`Expected an argument of type ${f.argument.kind.toString()}, but got ${a.toString()}`);
-        }*/
         const argType = (typeof this.argument.kind == "symbol" && this.argument.kind in this.closureTable)
-            ? this.closureTable[this.argument.kind]?.data as unknown as IType
+            ? this.closureTable[this.argument.kind]!.data.asType()
             : this.argument.kind;
         return `(${new Identifier(this.argument.name, argType).toString()}) => { ${this.definition.toString()} }`;
     }
@@ -238,9 +236,24 @@ class Match implements IExpr {
 // `ObjClass` is like `Func` ... in that it is a `Thing`.
 // the type of every `ObjClass` is a special type: `Symbol.for("Type")`
 class ObjClass extends Thing implements IType {
+    // oh no not more closure tables...
+    // yeah it turns out that factory functions (... => Type) might need them
+    // at least it should be less painful to implement the second time around
+    closureTable: SymTable;
     // each item in `constructors` is one way to construct this object
-    constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); }
-    toString() {return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(this.constructors).map(x => `${x.toString()} (${this.constructors[x as symbol]!.join(", ")})`).join(", ")} }`);}
+    constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); this.closureTable = {}; }
+    toString() {
+        const ctable = this.closureTable;
+        const reFields: Record<symbol, Identifier[]> = {};
+        for(const key of Reflect.ownKeys(this.constructors)) {
+            const ids = this.constructors[key as symbol]!;
+            reFields[key as symbol] = ids.map(id => new Identifier(
+                id.name,
+                (typeof id.kind == "symbol" && id.kind in ctable) ? ctable[id.kind]!.data.asType() : id.kind
+            ));
+        }
+        return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
+    }
     isSameThing(b: Thing, symTable: SymTable): boolean {
         // classes are equal if their structures are the same
         // generally `isSameThing` will be identical to `isSameType` if the latter exists
@@ -249,6 +262,10 @@ class ObjClass extends Thing implements IType {
     }
     checkExprType(_: SymTable): Type {
         return Symbol.for("Type"); // the type of any class is Type
+    }
+    evalExpr(symTable: SymTable) {
+        this.closureTable = {...symTable};
+        return new Value(this, Symbol.for("Type"));
     }
     isSameType(b: Type, symTable: SymTable): boolean {
         return b instanceof ObjClass &&
@@ -275,11 +292,13 @@ class Construct implements IExpr {
             throw new Error(`${this.toaster.toString()} is not a class, it is: ${cons.toString()}`);
         }
         // evaluate each field
+        // also, take into account the object's closure table if it has one
+        const fullTable = {...symTable, ...cons.data.closureTable};
         const computedFields: Record<symbol, Value> = {};
         for(const key of Reflect.ownKeys(this.fields)) {
-            computedFields[key as symbol] = evalExpr(this.fields[key as symbol]!, symTable);
+            computedFields[key as symbol] = evalExpr(this.fields[key as symbol]!, fullTable);
         }
-        return evalExpr(new Obj(cons.data, this.cons, computedFields), symTable);
+        return evalExpr(new Obj(cons.data, this.cons, computedFields), fullTable);
     }
 }
 // a constructed object
@@ -427,8 +446,8 @@ function isSameType(at: Type, bt: Type, symTable: SymTable, iters = 0): boolean 
     //console.info(`Comparing types of ${at.toString()} and ${bt.toString()}`);
     // deref
     if(typeof at == "symbol" && typeof bt == "symbol" && at == bt) return true;
-    const a = (typeof at == "symbol") ? deref(at, symTable).data as unknown as IType : at;
-    const b = (typeof bt == "symbol") ? deref(bt, symTable).data as unknown as IType : bt;
+    const a = (typeof at == "symbol") ? deref(at, symTable).data.asType() : at;
+    const b = (typeof bt == "symbol") ? deref(bt, symTable).data.asType() : bt;
     // compare, dereferencing recursively if necessary
     return (a == at && b == bt) ? a.isSameType(b, symTable) : isSameType(a, b, symTable, iters + 1);
 }
@@ -553,6 +572,23 @@ console.log(parseNat(makeNat(10).data, natTable).toString());
 console.log(evalExpr(new Call(_is0, _anotherZero), natTable).toString());
 console.log(evalExpr(new Call(_anotherIs0, _1), natTable).toString());
 console.log(evalExpr(new Construct(_Nat, _succ, {[_prev]: new PropertyAccess(_2, _prev)}), natTable).toString());
+
+// advanced object testing
+const _Or = Symbol("Or"), _Or1 = Symbol("Or1"), _Or2 = Symbol("Or2"), _OrL = Symbol("OrL"), _OrR = Symbol("OrR"), _OrA = Symbol("OrA"), _OrB = Symbol("OrB");
+const orClass = [
+    new FuncDefinition(_Or, new Identifier(_Or1, Symbol.for("Type")), new Func(
+        new Identifier(_Or2, Symbol.for("Type")),
+        new ObjClass({
+            [_OrL]: [new Identifier(_OrA, _Or1)],
+            [_OrR]: [new Identifier(_OrB, _Or2)]
+        })
+    ))
+];
+const orTable = evalStmts(orClass, {});
+console.log(evalExpr(
+    new Call(new Call(_Or, _Bool), _Nat),
+    {...natTable, ...orTable}
+).toString());
 
 // proposition testing
 const _refl = Symbol("refl"), _P = Symbol("P"), _p = Symbol("p"), _a = Symbol("a"), _A = Symbol("A"), _b = Symbol("b"), _B = Symbol("B");
