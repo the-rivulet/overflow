@@ -239,7 +239,7 @@ class ObjClass extends Thing implements IType {
     // at least it should be less painful to implement the second time around
     closureTable: SymTable;
     // each item in `constructors` is one way to construct this object
-    constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "") { super(); this.closureTable = {}; }
+    constructor(public constructors: Record<symbol, Identifier[]>, private debugName: string = "", private debugFields: Expression[] = []) { super(); this.closureTable = {}; }
     toString() {
         const ctable = this.closureTable;
         const reFields: Record<symbol, Identifier[]> = {};
@@ -250,7 +250,7 @@ class ObjClass extends Thing implements IType {
                 (typeof id.kind == "symbol" && id.kind in ctable) ? ctable[id.kind]!.data.asType() : id.kind
             ));
         }
-        return "class " + (this.debugName ? `'${this.debugName}'` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
+        return "class " + (this.debugName ? `${this.debugName}${this.debugFields.length ? `<${this.debugFields.map(x => evalExpr(x, this.closureTable).data.toString().replace("class ", "")).join(", ")}>` : ""}` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
     }
     isSameThing(b: Thing, symTable: SymTable): boolean {
         // classes are equal if their structures are the same
@@ -625,7 +625,7 @@ const orClass = new FuncDefinition(_Or, new Identifier(_Or1, Any), new Func(
     new ObjClass({
         [_OrL]: [new Identifier(_value, _Or1)],
         [_OrR]: [new Identifier(_value, _Or2)]
-    }, "Or")
+    }, "Or", [_Or1, _Or2])
 ));
 const orTable = evalStmts([orClass], {});
 console.log(evalExpr(
@@ -637,7 +637,7 @@ const andClass = new FuncDefinition(_And, new Identifier(_And1, Any), new Func(
     new Identifier(_And2, Any),
     new ObjClass({
         [_And_intro]: [new Identifier(_fst, _And1), new Identifier(_snd, _And2)],
-    }, "And")
+    }, "And", [_And1, _And2])
 ));
 const andTable = evalStmts([andClass], {});
 console.log(evalExpr(
