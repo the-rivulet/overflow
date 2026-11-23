@@ -18,6 +18,7 @@ interface IStmt {
 type Type = symbol | IType;
 interface IType {
     isSameType(b: Type, env: Environment): boolean;
+    formatType(env: Environment, resolving: Set<symbol>): string;
 }
 function asType(x: IExpr) {
     if(!("isSameType" in x)) throw new Error(`${x.toString()} isn't even remotely like a Type`);
@@ -47,6 +48,7 @@ class OpaqueThing extends Thing {
 class OpaqueType extends Thing implements IType {
     constructor(public name: symbol, public sort: UniverseType) { super(); }
     toString(): string { return this.name.description!; }
+    formatType() { return this.toString(); }
     isSameThing(b: Thing, _: Environment): boolean { return b instanceof OpaqueType && b == this; }
     isSameType(b: Type, _: Environment): boolean { return b instanceof OpaqueType && b == this; }
     checkExprType(_: Environment): Type { return this.sort; }
@@ -61,7 +63,14 @@ class Identifier {
 class Value {
     constructor(public data: Thing, public kind: Type) {}
     toString() {
-        return `${this.data} : ${this.kind.toString()}`;
+        try {
+            const env = this.data instanceof Func
+                ? this.data.environment
+                : new Environment();
+            return `${this.data.toString()} : ${formatType(this.kind, env)}`;
+        } catch(e) {
+            return `${this.data.toString()} : ${this.kind.toString()}`;
+        }
     }
 }
 
@@ -70,6 +79,12 @@ type SymTable = Record<symbol, Value>;
 // an environment holding defined variables and arguments
 class Environment {
     constructor(public parent?: Environment, public bindings: SymTable = {}) {}
+    toString(): string {
+        return (Reflect.ownKeys(this.bindings) as symbol[])
+            .map(x => `* "${x.description}" : ${this.bindings[x]?.toString()}`)
+            .join("\n")
+            + (this.parent ? "\n=== over: ===\n" + this.parent.toString() : "");
+    }
     tryGet(name: symbol): Value | undefined {
         if(name in this.bindings) return this.bindings[name];
         else if(this.parent) return this.parent.tryGet(name);
@@ -108,7 +123,7 @@ class Call implements IExpr {
             throw new Error(`${this.func.toString()} is not a function type, it is: ${vt.toString()}`);
         }
         // use the function's environment when checking the argument if it is a symbol
-        const functionValue = typeof this.func == "symbol" ? deref(this.func, env) : undefined;
+        const functionValue = typeof this.func == "symbol" ? env.get(this.func) : undefined;
         const env2 = functionValue?.data instanceof Func
             ? env.under(functionValue.data.environment)
             : env;
@@ -204,7 +219,7 @@ class FuncDefinition implements IStmt {
 // while capturing its context
 class Lambda implements IExpr {
     constructor(public argument: Identifier, public definition: Expression) {}
-    toString(): string { return `(${this.argument.toString()}) => { ${this.definition.toString()} }`; }
+    toString(): string { return `λ (${this.argument.toString()}) => ${this.definition.toString()}`; }
     checkExprType(env: Environment): Type {
         const argumentSort = resolveType(this.argument.kind, env);
         // choose an appropriate placeholder for the argument
@@ -227,13 +242,10 @@ class Lambda implements IExpr {
 class Func extends Thing {
     constructor(public argument: Identifier, public definition: Expression, public environment: Environment) { super(); }
     toString(): string {
-        // when stringifying a function, use its environment to resolve types before printing them
-        // so that a more helpful type can be given
-        const capturedValue = (typeof this.argument.kind == "symbol")
-            ? this.environment.tryGet(this.argument.kind)
-            : undefined;
-        const argType = capturedValue ? asType(capturedValue.data) : this.argument.kind;
-        return `(${new Identifier(this.argument.name, argType).toString()}) => { ${this.definition.toString()} }`;
+        return `(${this.argument.name.description} : ${formatType(
+            this.argument.kind,
+            this.environment
+        )}) => ${this.definition.toString()}`;
     }
     // functions aren't considered "the same"
     isSameThing(_b: Thing, _env: Environment): boolean { return false; }
@@ -245,6 +257,9 @@ class Func extends Thing {
 class FuncType implements IType {
     constructor(public inType: Type, public outType: Type) {}
     toString(): string {return `(${this.inType.toString()} => ${this.outType.toString()})`;}
+    formatType(env: Environment, resolving: Set<symbol>) {
+        return `(${formatType(this.inType, env, resolving)} => ${formatType(this.outType, env, resolving)})`;
+    }
     isSameType(b: Type, env: Environment): boolean {
         return b instanceof FuncType && isSameType(this.inType, b.inType, env) && isSameType(this.outType, b.outType, env);
     }
@@ -256,6 +271,7 @@ class FuncType implements IType {
 class ComputedType implements IType {
     constructor(public expression: Expression) {}
     toString(): string { return this.expression.toString(); }
+    formatType(env: Environment, resolving: Set<symbol>) { return formatType(resolveType(this, env), env, resolving); }
     isSameType(b: Type, env: Environment): boolean {
         return isSameType(resolveType(this, env), b, env);
     }
@@ -343,6 +359,7 @@ class ObjClass extends Thing implements IType {
         }
         return "class " + (this.debugName ? `${this.debugName}${this.debugFields.length ? `<${this.debugFields.map(x => evalExpr(x, this.myEnv).data.toString().replace("class ", "")).join(", ")}>` : ""}` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
     }
+    formatType() { return this.toString(); }
     isSameThing(b: Thing, env: Environment): boolean {
         // like `Func`s, these are not considered to be equal.
         return b instanceof ObjClass && this.isSameType(b, env);
@@ -354,7 +371,7 @@ class ObjClass extends Thing implements IType {
         if(!(b instanceof ObjClass)) return false;
         const k1 = Reflect.ownKeys(this.constructors) as symbol[], k2 = Reflect.ownKeys(b.constructors) as symbol[];
         return k1.length == k2.length && k1.every(
-            cons => cons in k2 &&
+            cons => k2.includes(cons) &&
             this.constructors[cons]!.length == b.constructors[cons]!.length &&
             this.constructors[cons]!.every(
                 (id, i) => id.name == b.constructors[cons]![i]!.name && isSameType(id.kind, b.constructors[cons]![i]!.kind, env)
@@ -475,7 +492,7 @@ class Obj extends Thing {
             throw new Error(`Object is missing a property: ${missing.name.description}`);
         }
         // finally, make sure that the types of all properties are correct
-        const wrong = constructors.find(key => !(accepts(this.fields[key.name]!.kind, key.kind, env)));
+        const wrong = constructors.find(key => !(accepts(this.fields[key.name]!.kind, this.toaster.instantiateCapturedType(key.kind), env)));
         if(wrong) {
             // when throwing an error in this way, try to use the symbol table to change the argument type
             const expected = typeof wrong.kind == "symbol" ? env.tryGet(wrong.kind) : undefined;
@@ -626,14 +643,24 @@ class OpaqueProp extends Proposition {
     isSameType(b: Type, _: Environment): boolean { return b instanceof OpaqueProp && this.data == b.data; }
 }
 
-// function for quickly dereferencing a value
-function deref(code: symbol, env: Environment) {
-    return env.get(code);
+// utility function for printing types
+function formatType(type: Type, env: Environment, resolving = new Set<symbol>()): string {
+    if(typeof type == "symbol") {
+        if(resolving.has(type)) return type.description!;
+        const value = env.tryGet(type);
+        if(!value || !isType(value.data)) return type.description!;
+        const next = new Set(resolving);
+        next.add(type);
+        return formatType(value.data, env, next);
+    } else {
+        return type.formatType(env, resolving);
+    }
 }
+
 // dereference and evaluate computed types
 function resolveType(type: Type, env: Environment) {
     // symbols get dereferenced
-    if(typeof type == "symbol") return asType(deref(type, env).data);
+    if(typeof type == "symbol") return asType(env.get(type).data);
     // computed types get evaluated
     if(type instanceof ComputedType) return asType(evalExpr(type.expression, env).data);
     return type;
@@ -683,7 +710,7 @@ const evalStmts = (code: Statement[], env: Environment) => code.reduce((table, s
 function checkExprType(code: Expression, env: Environment): Type {
     //console.info(`Type-checking '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => typeof x == "string" ? x : x.description).join(", ")}`);
     if(typeof code == "symbol") {
-        return deref(code, env).kind;
+        return env.get(code).kind;
     } else {
         return code.checkExprType(env);
     }
@@ -693,7 +720,7 @@ function evalExpr(code: Expression, env: Environment): Value {
     //console.info(`Evaluating '${code.toString()}' using symbols: ${Reflect.ownKeys(symTable).map(x => x.toString()).join(", ")}`);
     // do something based on what kind of expression it is
     if(typeof code == "symbol") {
-        return deref(code, env);
+        return env.get(code);
     } else {
         return code.evalExpr(env);
     }
@@ -827,24 +854,30 @@ console.log(evalExpr(
 
 // functions can take `And`s and `Or`s
 const _Or_elim = Symbol("Or_elim"), _Oe1 = Symbol("oe1"), _Oe2 = Symbol("oe2"), _orX = Symbol("X"), _Target = Symbol("Target"), _imp1 = Symbol("imp1"), _imp2 = Symbol("imp2");
-console.log(evalExpr(
-    new Return([
-        new FuncDefinition(_Or_elim, new Identifier(_Oe1, new UniverseType()), new Lambda(
-            new Identifier(_Oe2, new UniverseType()), new Lambda(
-                new Identifier(_Target, new UniverseType()), new Lambda(
-                    new Identifier(_orX, new ComputedType(new Call(new Call(_Or, _Oe1), _Oe2))), new Lambda(
-                        new Identifier(_imp1, new FuncType(_Oe1, _Target)), new Lambda(
-                            new Identifier(_imp2, new FuncType(_Oe2, _Target)), new Pattern(
-                                _orX, {
-                                    [_OrL]: new Call(_imp1, new PropertyAccess(_orX, _value)),
-                                    [_OrR]: new Call(_imp2, new PropertyAccess(_orX, _value))
-                                }
-                            )
+const orElim = evalStmt(
+    new FuncDefinition(_Or_elim, new Identifier(_Oe1, new UniverseType()), new Lambda(
+        new Identifier(_Oe2, new UniverseType()), new Lambda(
+            new Identifier(_Target, new UniverseType()), new Lambda(
+                new Identifier(_orX, new ComputedType(new Call(new Call(_Or, _Oe1), _Oe2))), new Lambda(
+                    new Identifier(_imp1, new FuncType(_Oe1, _Target)), new Lambda(
+                        new Identifier(_imp2, new FuncType(_Oe2, _Target)), new Pattern(
+                            _orX, {
+                                [_OrL]: new Call(_imp1, new PropertyAccess(_orX, _value)),
+                                [_OrR]: new Call(_imp2, new PropertyAccess(_orX, _value))
+                            }
                         )
                     )
                 )
             )
-        ))
-    ], new Call(_Or_elim, _Bool)),
-    boolTable.under(orTable)
-).toString());
+        )
+    )), 
+    boolTable.under(natTable.under(orTable))
+);
+const orElim1 = evalExpr(new Call(_Or_elim, _Bool), orElim); console.log(orElim1.toString());
+const orElim2 = evalExpr(new Call(orElim1.data, _Nat), orElim); console.log(orElim2.toString());
+const orElim3 = evalExpr(new Call(orElim2.data, _Nat), orElim); console.log(orElim3.toString());
+const orElimC = evalExpr(new Construct(new Call(new Call(_Or, _Bool), _Nat), _OrR, {[_value]: _0}), orElim); console.log(orElimC.toString());
+const orElim4 = evalExpr(new Call(orElim3.data, orElimC.data), orElim); console.log(orElim4.toString());
+const orElim5 = evalExpr(new Call(orElim4.data, new Lambda(new Identifier(_x, _Bool), _0)), orElim); console.log(orElim5.toString());
+const orElim6 = evalExpr(new Call(orElim5.data, new Lambda(new Identifier(_x, _Nat), _1)), orElim); console.log(orElim6.toString());
+// yay!! it finally works!!
