@@ -80,10 +80,10 @@ type SymTable = Record<symbol, Value>;
 class Environment {
     constructor(public parent?: Environment, public bindings: SymTable = {}) {}
     toString(): string {
-        return (Reflect.ownKeys(this.bindings) as symbol[])
+        return "\n" + (Reflect.ownKeys(this.bindings) as symbol[])
             .map(x => `* "${x.description}" : ${this.bindings[x]?.toString()}`)
             .join("\n")
-            + (this.parent ? "\n=== over: ===\n" + this.parent.toString() : "");
+            + (this.parent ? "\n=============" + this.parent.toString() : "");
     }
     tryGet(name: symbol): Value | undefined {
         if(name in this.bindings) return this.bindings[name];
@@ -511,7 +511,38 @@ class PropertyAccess implements IExpr {
     constructor(public obj: Expression, public field: symbol) {}
     toString(): string {return `${this.obj.toString()}.${this.field.description}`};
     checkExprType(env: Environment): Type {
-        return evalExpr(this, env).kind;
+        const receiver = typeof this.obj === "symbol" ? env.tryGet(this.obj) : undefined;
+        if(receiver?.data instanceof Obj) {
+            const field = receiver.data.fields[this.field];
+            if(field == undefined) {
+                throw new Error(`${receiver.toString()} does not have a field named ${this.field.description}`);
+            }
+            return field.kind;
+        }
+        // otherwise, inspect the receiver's declared type
+        const receiverType = checkExprType(this.obj, env);
+        const toaster = resolveType(receiverType, env);
+        if(!(toaster instanceof ObjClass)) {
+            throw new Error(`${this.obj.toString()} is not an object, it is: ${receiverType.toString()}`);
+        }
+        // find every constructor field with this name
+        const matchingFields = (Reflect.ownKeys(toaster.constructors) as symbol[])
+            .flatMap(cons => toaster.constructors[cons]!)
+            .filter(field => field.name === this.field);
+        // ...and error if there are none
+        if(matchingFields.length === 0) {
+            throw new Error(`No constructor of ${toaster.toString()} defines a field named ${this.field.description}`);
+        }
+        // resolve the field's type using the class's captured environment
+        const fieldTypes = matchingFields.map(field => toaster.instantiateCapturedType(field.kind));
+        // a field appearing in multiple constructors must have the same
+        // type in every constructor, unless the receiver was already refined.
+        // otherwise, it's too difficult to know what the resultant type should be.
+        const fieldType = fieldTypes[0]!;
+        if(!fieldTypes.every(type => isSameType(type, fieldType, env))) {
+            throw new Error(`Cannot determine the type of ${this.field.description}: it has different types in different constructors`);
+        }
+        return fieldType;
     }
     evalExpr(env: Environment): Value {
         const obj = evalExpr(this.obj, env);
@@ -881,3 +912,16 @@ const orElim4 = evalExpr(new Call(orElim3.data, orElimC.data), orElim); console.
 const orElim5 = evalExpr(new Call(orElim4.data, new Lambda(new Identifier(_x, _Bool), _0)), orElim); console.log(orElim5.toString());
 const orElim6 = evalExpr(new Call(orElim5.data, new Lambda(new Identifier(_x, _Nat), _1)), orElim); console.log(orElim6.toString());
 // yay!! it finally works!!
+
+// proposition testing
+const _And_elimL = Symbol("And_elimL"), _Ae1 = Symbol("Ae1"), _Ae2 = Symbol("Ae2");
+const andElimL = evalStmt(
+    new FuncDefinition(_And_elimL, new Identifier(_Ae1, new UniverseType()), new Lambda(
+        new Identifier(_Ae2, new UniverseType()), new Lambda(
+            new Identifier(_and, new ComputedType(new Call(new Call(_And, _Ae1), _Ae2))),
+            new PropertyAccess(_and, _fst)
+        )
+    )),
+    andTable
+);
+console.log(andElimL.toString());
