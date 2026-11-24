@@ -511,7 +511,7 @@ class PropertyAccess implements IExpr {
     constructor(public obj: Expression, public field: symbol) {}
     toString(): string {return `${this.obj.toString()}.${this.field.description}`};
     checkExprType(env: Environment): Type {
-        const receiver = typeof this.obj === "symbol" ? env.tryGet(this.obj) : undefined;
+        const receiver = typeof this.obj == "symbol" ? env.tryGet(this.obj) : undefined;
         if(receiver?.data instanceof Obj) {
             const field = receiver.data.fields[this.field];
             if(field == undefined) {
@@ -528,9 +528,9 @@ class PropertyAccess implements IExpr {
         // find every constructor field with this name
         const matchingFields = (Reflect.ownKeys(toaster.constructors) as symbol[])
             .flatMap(cons => toaster.constructors[cons]!)
-            .filter(field => field.name === this.field);
+            .filter(field => field.name == this.field);
         // ...and error if there are none
-        if(matchingFields.length === 0) {
+        if(matchingFields.length == 0) {
             throw new Error(`No constructor of ${toaster.toString()} defines a field named ${this.field.description}`);
         }
         // resolve the field's type using the class's captured environment
@@ -564,9 +564,7 @@ class Pattern implements IExpr {
         const keys = Reflect.ownKeys(this.cases) as symbol[];
         if(keys.length == 0) throw new Error("Pattern has no cases");
 
-        // Resolve the matched value's type to the object class that defines
-        // its constructors. A ComputedType may be needed for factory types
-        // such as Or(A)(B).
+        // resolve the matched value to determine which class it is
         const variableType = checkExprType(this.variable, env);
         const toaster = resolveType(variableType, env);
         if(!(toaster instanceof ObjClass)) {
@@ -580,18 +578,14 @@ class Pattern implements IExpr {
         const missing = constructors.find(key => !keys.includes(key));
         if(missing) throw new Error(`Pattern is missing a case: ${missing.description}`);
 
-        // Type-check every arm with a synthetic object of that constructor.
-        // This makes field accesses (e.g. X.value) know the field's refined type.
+        // once the constructor is known, construct a synthetic version of it
         let armType: Type | undefined;
         for(const cons of keys) {
             const extras: SymTable = {};
             if(typeof this.variable == "symbol") {
                 const fields: Record<symbol, Value> = {};
                 for(const field of toaster.constructors[cons]!) {
-                    // Resolve field annotations in the class's own captured
-                    // environment. For polymorphic factories this turns Or1
-                    // into the TypeVariable (or concrete type) captured when
-                    // this particular class was created.
+                    // resolve fields
                     const fieldType = toaster.instantiateCapturedType(field.kind);
                     fields[field.name] = new Value(new OpaqueThing(undefined), fieldType);
                 }
@@ -600,9 +594,7 @@ class Pattern implements IExpr {
             const env2 = new Environment(env, {...extras});
 
             const currentType = checkExprType(this.cases[cons]!, env2);
-            if(armType === undefined) {
-                armType = currentType;
-            }
+            if(armType == undefined) { armType = currentType; }
             else if(!accepts(currentType, armType, env2)) {
                 throw new Error(`First pattern returns type ${armType.toString()}, but another arm returns type ${currentType.toString()}`);
             }
