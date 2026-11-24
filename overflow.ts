@@ -687,12 +687,6 @@ abstract class Proof extends Thing {
     }
     checkExprType(_: Environment) { return this.prop; }
 }
-// a helpful interface for proof-related things
-// very simple, just IExpr with a more restricted expr type
-// but it will be helpful
-interface ITactic extends IExpr {
-    checkExprType(env: Environment): Proposition;
-}
 
 // the type of equality propositions `a = b`
 class Equal extends Proposition {
@@ -735,12 +729,15 @@ class RflProof extends Proof {
     prop: Equal;
     constructor(public value: Value, public context: Environment) { super(); this.prop = new Equal(value.kind, value, value); }
 }
-class RflTactic implements ITactic {
+class RflTactic implements IExpr {
     constructor(public value: Expression) {}
     toString() { return "reflexivity on " + this.value.toString(); }
     checkExprType(env: Environment) {
-        // I don't know what to do about this one that doesn't involve calling `evalExpr`
-        return (this.evalExpr(env).data as Proof).prop;
+        const vtype = checkExprType(this.value, env);
+        const placeholder = vtype instanceof UniverseType
+            ? new OpaqueType(Symbol(this.value.toString()), vtype)
+            : new OpaqueThing(Symbol(this.value.toString()));
+        return new Equal(vtype, new Value(placeholder, vtype), new Value(placeholder, vtype));
     }
     evalExpr(env: Environment): Value {
         const value = evalExpr(this.value, env);
@@ -770,13 +767,11 @@ class SubstProof extends Proof {
     // wow, that was pretty easy! a big win for object oriented programming
     // can you tell I was in a jolly mood while writing this comment
 }
-class SubstTactic implements ITactic {
+class SubstTactic implements IExpr {
     constructor(public x: Expression, public y: Expression, public eq: Expression, public p: Expression, public px: Expression) {}
-    toString() { return `substitute ${this.x.toString()} -> ${this.y.toString()} in ${this.p.toString()}` }
-    checkExprType(env: Environment) {
-        // I don't know what to do about this one that doesn't involve calling `evalExpr`
-        // .....again.
-        return (this.evalExpr(env).data as Proof).prop;
+    toString() { return `substitute ${this.x.toString()} -> ${this.y.toString()} in { ${this.p.toString()} }`; }
+    checkExprType(_: Environment) {
+        return new ComputedType(new Call(this.p, this.y));
     }
     evalExpr(env: Environment): Value {
         // first go ahead and evaluate all the things
@@ -1044,7 +1039,7 @@ const andElimL = evalStmt(
 console.log(andElimL.toString());
 
 // equality testing
-const _rfl = Symbol("rfl"), _v = Symbol("v");
+const _rfl = Symbol("rfl"), _v = Symbol("v"), _w = Symbol("w");
 const basicRfl = evalStmt(
     new FuncDefinition(_rfl, new Identifier(_v, Any), new RflTactic(_v)),
     new Environment()
@@ -1079,3 +1074,44 @@ const plus = evalStmt(
     natTable
 );
 console.log(parseNat(new Call(new Call(_plus, _1), _1), plus));
+
+// advanced equality operations, yay!
+const _symm = Symbol("symm"), _trans = Symbol("trans"), _eq_vw = Symbol("eq_vw"), _eq_wv = Symbol("eq_wv"), _eq_wx = Symbol("eq_wx"), _T = Symbol("T");
+const equalityOps = [
+    new FuncDefinition(_rfl, new Identifier(_v, Any), new RflTactic(_v)),
+    new FuncDefinition(_symm, new Identifier(_T, new UniverseType()), new Lambda(
+        new Identifier(_v, _T), new Lambda(
+            new Identifier(_w, _T), new Lambda(
+                new Identifier(_eq_vw, new ComputedType(new EqualExpr(_T, _v, _w))), new SubstTactic(
+                    _v, _w, _eq_vw,
+                    new Lambda(new Identifier(_z, _T), new EqualExpr(_T, _z, _v)),
+                    new RflTactic(_v)
+                )
+            )
+        )
+    )),
+    new FuncDefinition(_trans, new Identifier(_T, new UniverseType()), new Lambda(
+        new Identifier(_v, _T), new Lambda(
+            new Identifier(_w, _T), new Lambda(
+                new Identifier(_x, _T), new Lambda(
+                    new Identifier(_eq_wv, new ComputedType(new EqualExpr(_T, _w, _v))), new Lambda(
+                        new Identifier(_eq_wx, new ComputedType(new EqualExpr(_T, _w, _x))), new SubstTactic(
+                            _w, _v, _eq_wv,
+                            new Lambda(new Identifier(_z, _T), new EqualExpr(_T, _z, _x)),
+                            _eq_wx
+                        )
+                    )
+                )
+            )
+        )
+    ))
+];
+const eqTable = evalStmts(equalityOps, new Environment());
+console.log(evalExpr(
+    new Call(new Call(new Call(new Call(_symm, _Nat), _a), _0), new RflTactic(_0)),
+    natTable.under(eqTable).and(_a, evalExpr(new Construct(_Nat, _zero, {}), natTable))
+).toString());
+console.log(evalExpr(
+    new Call(new Call(new Call(new Call(new Call(new Call(_trans, _Nat), _0), _0), _0), new RflTactic(_0)), new RflTactic(_0)),
+    natTable.under(eqTable)
+).toString());
