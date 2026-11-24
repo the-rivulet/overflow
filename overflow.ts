@@ -79,9 +79,9 @@ class Environment {
     constructor(public parent?: Environment, public bindings: SymTable = {}) {}
     toString(): string {
         return "\n" + (Reflect.ownKeys(this.bindings) as symbol[])
-            .map(x => `* "${x.description}" : ${this.bindings[x]?.toString()}`)
+            .map(x => `"${x.description}" : ${this.bindings[x]?.toString()}`)
             .join("\n")
-            + (this.parent ? "\n=============" + this.parent.toString() : "");
+            + (this.parent ? this.parent.toString() : "");
     }
     tryGet(name: symbol): Value | undefined {
         if(name in this.bindings) return this.bindings[name];
@@ -207,10 +207,13 @@ class FuncDefinition implements IStmt {
         );
     }
     evalStmt(env: Environment): Environment {
-        // use a lambda to define a new function
-        // then add it to the environment
-        const value = new Lambda(this.argument, this.definition).evalExpr(env);
-        return env.and(this.name, value);
+        // create a copy of the existing environment
+        const recursiveEnv = new Environment(env);
+        // create the function
+        const value = evalExpr(new Lambda(this.argument, this.definition), recursiveEnv);
+        // then sneak the function back into its own environment
+        recursiveEnv.bindings[this.name] = value;
+        return recursiveEnv;
     }
 }
 // an expression that creates an anonymouse function
@@ -734,6 +737,7 @@ class RflProof extends Proof {
 }
 class RflTactic implements ITactic {
     constructor(public value: Expression) {}
+    toString() { return "reflexivity on " + this.value.toString(); }
     checkExprType(env: Environment) {
         // I don't know what to do about this one that doesn't involve calling `evalExpr`
         return (this.evalExpr(env).data as Proof).prop;
@@ -768,6 +772,7 @@ class SubstProof extends Proof {
 }
 class SubstTactic implements ITactic {
     constructor(public x: Expression, public y: Expression, public eq: Expression, public p: Expression, public px: Expression) {}
+    toString() { return `substitute ${this.x.toString()} -> ${this.y.toString()} in ${this.p.toString()}` }
     checkExprType(env: Environment) {
         // I don't know what to do about this one that doesn't involve calling `evalExpr`
         // .....again.
@@ -1059,3 +1064,18 @@ console.log(evalExpr(
     ),
     natTable
 ).toString());
+
+// addition testing
+const _plus = Symbol("plus"), _a = Symbol("a"), _b = Symbol("b");
+const plus = evalStmt(
+    new FuncDefinition(_plus, new Identifier(_a, _Nat), new Lambda(
+        new Identifier(_b, _Nat), new Pattern(_a, {
+            [_zero]: _b,
+            [_succ]: new Construct(_Nat, _succ, {
+                [_prev]: new Call(new Call(_plus, new PropertyAccess(_a, _prev)), _b)
+            })
+        })
+    )),
+    natTable
+);
+console.log(parseNat(new Call(new Call(_plus, _1), _1), plus));
