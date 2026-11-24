@@ -64,9 +64,7 @@ class Value {
     constructor(public data: Thing, public kind: Type) {}
     toString() {
         try {
-            const env = this.data instanceof Func
-                ? this.data.environment
-                : new Environment();
+            const env = this.data instanceof Func ? this.data.environment : new Environment();
             return `${this.data.toString()} : ${formatType(this.kind, env)}`;
         } catch(e) {
             return `${this.data.toString()} : ${this.kind.toString()}`;
@@ -226,7 +224,7 @@ class Lambda implements IExpr {
         // based on whether it is a Type or a regular thing
         const placeholder = argumentSort instanceof UniverseType
             ? new OpaqueType(this.argument.name, argumentSort)
-            : new OpaqueThing(undefined);
+            : new OpaqueThing(Symbol(this.argument.name.description));
         const bodyEnvironment = env.and(this.argument.name, new Value(placeholder, this.argument.kind));
         return new FuncType(
             this.argument.kind,
@@ -357,7 +355,12 @@ class ObjClass extends Thing implements IType {
                 (typeof id.kind == "symbol" && this.myEnv.has(id.kind)) ? asType(this.myEnv.get(id.kind).data) : id.kind
             ));
         }
-        return "class " + (this.debugName ? `${this.debugName}${this.debugFields.length ? `<${this.debugFields.map(x => evalExpr(x, this.myEnv).data.toString().replace("class ", "")).join(", ")}>` : ""}` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
+        return "class " + (
+            this.debugName ? `${this.debugName}${
+                this.debugFields.length
+                ? `<${this.debugFields.map(x => evalExpr(x, this.myEnv).data.toString().replace("class ", "")).join(", ")}>`
+                : ""
+            }` : `{ ${Reflect.ownKeys(reFields).map(x => `${x.toString()} (${reFields[x as symbol]!.join(", ")})`).join(", ")} }`);
     }
     formatType() { return this.toString(); }
     isSameThing(b: Thing, env: Environment): boolean {
@@ -428,7 +431,11 @@ class Construct implements IExpr {
     constructor(public toaster: Expression, public cons: symbol, public fields: Record<symbol, Expression>) {}
     toString(): string {return `${this.toaster.toString()}.${this.cons.description}(${Reflect.ownKeys(this.fields).map(x => `${x.toString()} = ${this.fields[x as symbol]!.toString()}`).join(", ")})`;}
     checkExprType(env: Environment): Type {
-        return checkExprType(this.toaster, env);
+        const classValue = evalExpr(this.toaster, env);
+        if(!(classValue.data instanceof ObjClass)) {
+            throw new Error(`${this.toaster.toString()} is not a class, it is: ${classValue.toString()}`);
+        }
+        return classValue.data;
     }
     evalExpr(env: Environment): Value {
         // construct an object
@@ -664,6 +671,119 @@ class OpaqueProp extends Proposition {
     toString() {return `proposition "${this.data.toString()}"`;}
     // check the underlying data using its own equality function
     isSameType(b: Type, _: Environment): boolean { return b instanceof OpaqueProp && this.data == b.data; }
+}
+
+// a helpful class for proof-related things
+// a `Proof` should be constructed by its corresponding `Tactic`
+abstract class Proof extends Thing {
+    abstract prop: Proposition;
+    abstract context: Environment;
+    toString() { return "proof"; } // check the type if you want to know what it proves
+    isSameThing(b: Thing, env: Environment) {
+        return b instanceof Proof && isSameType(this.prop, b.prop, env);
+    }
+    checkExprType(_: Environment) { return this.prop; }
+}
+// a helpful interface for proof-related things
+// very simple, just IExpr with a more restricted expr type
+// but it will be helpful
+interface ITactic extends IExpr {
+    checkExprType(env: Environment): Proposition;
+}
+
+// the type of equality propositions `a = b`
+class Equal extends Proposition {
+    constructor(public carrier: Type, public left: Value, public right: Value) { super(); }
+    toString() { return `${this.left.data.toString()} = ${this.right.data.toString()}`; }
+    isSameType(b: Type, env: Environment): boolean {
+        return b instanceof Equal &&
+            isSameType(this.carrier, b.carrier, env) &&
+            isSameValue(this.left, b.left, env) &&
+            isSameValue(this.right, b.right, env);
+    }
+}
+// an expression that constructs an equality proposition
+// note that it doesn't actually have to be true at this point
+// you can construct the proposition 1 = 2, cause it's just a type
+// the problem will be constructing an element with the desired type
+// needs to exist because `Equal` needs values, but there isn't a good way to get those values directly
+class EqualExpr implements IExpr {
+    constructor(public carrier: Type, public left: Expression, public right: Expression) {}
+    toString(): string { return `${this.left.toString()} = ${this.right.toString()}`; }
+    checkExprType(env: Environment): Type {
+        const leftType = checkExprType(this.left, env);
+        const rightType = checkExprType(this.right, env);
+        if(!accepts(leftType, this.carrier, env)) {
+            throw new Error(`${this.left.toString()} should be of type ${this.carrier.toString()}, but it's ${checkExprType(this.left, env).toString()}`);
+        }
+        if(!accepts(rightType, this.carrier, env)) throw new Error(`${this.right.toString()} should be of type ${this.carrier.toString()}, but it's ${checkExprType(this.left, env).toString()}`);
+        return TProp; // yeah, I didn't really care about all that, just wanted to check
+                      // the check is important though, otherwise you could get a rather strange result
+    }
+    evalExpr(env: Environment): Value {
+        return new Value(new Equal(resolveType(this.carrier, env), evalExpr(this.left, env), evalExpr(this.right, env)), TProp);
+    }
+}
+
+// a proof of reflexivity
+class RflProof extends Proof {
+    // how nice! the base class does almost all of the work for us
+    // so easy and simple
+    prop: Equal;
+    constructor(public value: Value, public context: Environment) { super(); this.prop = new Equal(value.kind, value, value); }
+}
+class RflTactic implements ITactic {
+    constructor(public value: Expression) {}
+    checkExprType(env: Environment) {
+        // I don't know what to do about this one that doesn't involve calling `evalExpr`
+        return (this.evalExpr(env).data as Proof).prop;
+    }
+    evalExpr(env: Environment): Value {
+        const value = evalExpr(this.value, env);
+        const proof = new RflProof(value, env);
+        return new Value(proof, proof.prop);
+    }
+}
+
+// ok this is where it starts getting complicated
+// if x = y, and you have P(x) : Proposition, you can substitute to get P(y) as well
+// let's make a proof for it!
+class SubstProof extends Proof {
+    prop: Proposition; // the type of `prop` is always the kind of proposition you're going to prove.
+                       // which is nontrivial in this case so I'll leave it as `Proposition`
+    constructor(public x: Value, public y: Value, public eq: Proof, public p: (v: Value) => Proposition, public px: Proof, public context: Environment) {
+        // before just going ahead and constructing, it's important to make sure that
+        // the two proofs we asked for are what they purport to be
+        if(!(eq.prop instanceof Equal && isSameValue(eq.prop.left, x, context) && isSameValue(eq.prop.right, y, context))) {
+            throw new Error(`Substitution failed, the given x=y proof (${checkExprType(eq, context).toString()}) is not a proof of ${x.toString()} = ${y.toString()}`);
+        }
+        if(!(isSameThing(p(x), px.prop, context))) {
+            throw new Error(`Substitution failed, the given P(x) proof (${checkExprType(px, context).toString()}) is not a proof of ${p(x).toString()}`);
+        }
+        super();
+        this.prop = p(y);
+    }
+    // wow, that was pretty easy! a big win for object oriented programming
+    // can you tell I was in a jolly mood while writing this comment
+}
+class SubstTactic implements ITactic {
+    constructor(public x: Expression, public y: Expression, public eq: Expression, public p: Expression, public px: Expression) {}
+    checkExprType(env: Environment) {
+        // I don't know what to do about this one that doesn't involve calling `evalExpr`
+        // .....again.
+        return (this.evalExpr(env).data as Proof).prop;
+    }
+    evalExpr(env: Environment): Value {
+        // first go ahead and evaluate all the things
+        const x = evalExpr(this.x, env);
+        const y = evalExpr(this.y, env);
+        const eq = evalExpr(this.eq, env);
+        const px = evalExpr(this.px, env);
+        // then put them into the proof
+        // `SubstProof` is responsible for checking that the values are all ok
+        const proof = new SubstProof(x, y, eq.data as Proof, (v => evalExpr(new Call(this.p, v.data), env).data as Proposition), px.data as Proof, env);
+        return new Value(proof, proof.prop);
+    }
 }
 
 // utility function for printing types
@@ -917,3 +1037,25 @@ const andElimL = evalStmt(
     andTable
 );
 console.log(andElimL.toString());
+
+// equality testing
+const _rfl = Symbol("rfl"), _v = Symbol("v");
+const basicRfl = evalStmt(
+    new FuncDefinition(_rfl, new Identifier(_v, Any), new RflTactic(_v)),
+    new Environment()
+);
+console.log(basicRfl.toString());
+console.log(evalExpr(new Call(_rfl, _true), natTable.under(basicRfl)).toString());
+
+// ...and substitution...
+const _z = Symbol("z");
+console.log(evalExpr(
+    new SubstTactic(
+        _0, _0, new RflTactic(_0),
+        new Lambda(new Identifier(_z, _Nat), new EqualExpr(
+            _Nat, new Construct(_Nat, _succ, {[_prev]: _z}), _1
+        )),
+        new RflTactic(_1)
+    ),
+    natTable
+).toString());
